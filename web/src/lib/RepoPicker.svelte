@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ReposResponse, RepoProbe, ServerStatus } from './types'
-  import { kitLabel, ago, clockNote, shortSha } from './format'
+  import { kitLabel, ago, clockNote } from './format'
 
   interface Props {
     data: ReposResponse

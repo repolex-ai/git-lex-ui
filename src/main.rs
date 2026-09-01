@@ -10,6 +10,8 @@
 //! behind a proxy keyed on each repo's genesis sha — its permanent identity —
 //! never on a port number, because a port number is a place and not a name.
 
+mod layout;
+mod layout_api;
 mod registry;
 mod repo;
 mod supervisor;
@@ -72,6 +74,8 @@ struct AppState {
     web_dir: PathBuf,
     lex_dir: PathBuf,
     cache_dir: PathBuf,
+    /// Packed layout payloads, by genesis sha, for the companion data route.
+    layouts: RwLock<HashMap<String, Arc<Vec<u8>>>>,
     registry_path: RwLock<Option<String>>,
     registry_format: RwLock<Option<String>>,
     started_ms: u128,
@@ -119,6 +123,7 @@ async fn main() {
         web_dir: web_dir.clone(),
         lex_dir: lex_dir.clone(),
         cache_dir: cache_dir.clone(),
+        layouts: RwLock::new(HashMap::new()),
         registry_path: RwLock::new(None),
         registry_format: RwLock::new(None),
         started_ms: now_ms(),
@@ -137,6 +142,8 @@ async fn main() {
         .route("/api/servers/open", post(api_open))
         .route("/api/servers/stop", post(api_stop))
         .route("/api/health", get(api_health))
+        .route("/api/layout/{genesis}", get(api_layout_meta))
+        .route("/api/layout/{genesis}/data", get(api_layout_data))
         .route("/r/{genesis}/api/{*rest}", get(proxy_get).post(proxy_post))
         .route("/{*asset}", get(static_asset))
         .with_state(Arc::clone(&state));
@@ -372,6 +379,102 @@ async fn api_health(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "cache_dir": s.cache_dir.display().to_string(),
         "browser_shim": supervisor::shim_dir(&s.cache_dir).join("open").display().to_string(),
     }))
+}
+
+// ------------------------------------------------------------------- layout
+
+/// Resolve a genesis sha to a live, verified server AND the repo it belongs
+/// to, since the layout needs the repo's HEAD to key its cache.
+async fn layout_target(
+    s: &Arc<AppState>,
+    genesis: &str,
+) -> Result<(repo::RepoProbe, u16), (StatusCode, String)> {
+    let path = s.by_genesis.read().await.get(genesis).cloned().ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no repo on this machine has genesis {genesis}"),
+    ))?;
+    let probe = s
+        .repos
+        .read()
+        .await
+        .iter()
+        .find(|r| r.path == path)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "repo vanished from the list".to_string()))?;
+    let port = s.sup.proxy_port(&path).await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no verified server is running for this repo".to_string(),
+        )
+    })?;
+    Ok((probe, port))
+}
+
+/// Build (or reuse) the layout and return its metadata. The binary payload
+/// comes from the companion `/data` route.
+async fn api_layout_meta(
+    State(s): State<Arc<AppState>>,
+    AxPath(genesis): AxPath<String>,
+) -> Response {
+    let (probe, port) = match layout_target(&s, &genesis).await {
+        Ok(v) => v,
+        Err((c, m)) => return (c, m).into_response(),
+    };
+    let head = probe.head_sha.clone().unwrap_or_default();
+
+    if let Some(c) = layout_api::load(&s.cache_dir, &genesis, &head) {
+        s.layouts.write().await.insert(genesis.clone(), Arc::new(c.data));
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                // Say where it came from. A cached figure presented as
+                // current is the whole defect class this header exists to
+                // prevent.
+                (axum::http::HeaderName::from_static("x-layout-source"), "cache"),
+            ],
+            c.meta_json,
+        )
+            .into_response();
+    }
+
+    let built = match layout_api::build_from_server(&s.http, port, &genesis, &head).await {
+        Ok(l) => l,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let meta_json = match layout_api::store(&s.cache_dir, &genesis, &head, &built) {
+        Ok(j) => j,
+        // A cache we could not write is a slow path, not a failure.
+        Err(_) => serde_json::to_string(&built.meta).unwrap_or_default(),
+    };
+    s.layouts.write().await.insert(genesis.clone(), Arc::new(built.data));
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::HeaderName::from_static("x-layout-source"), "computed"),
+        ],
+        meta_json,
+    )
+        .into_response()
+}
+
+/// The packed typed arrays: positions, colours, sizes, edge indices. Goes
+/// straight into GPU buffers, so it travels as bytes and never as JSON.
+async fn api_layout_data(
+    State(s): State<Arc<AppState>>,
+    AxPath(genesis): AxPath<String>,
+) -> Response {
+    if let Some(d) = s.layouts.read().await.get(&genesis).cloned() {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            (*d).clone(),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        "no layout has been built for this repo yet — request its metadata first",
+    )
+        .into_response()
 }
 
 // -------------------------------------------------------------------- proxy

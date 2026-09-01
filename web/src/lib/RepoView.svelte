@@ -3,6 +3,7 @@
   import { sparql } from './api'
   import * as Q from './queries'
   import { kitLabel, shortSha, ago } from './format'
+  import Spiral from './Spiral.svelte'
 
   interface Props {
     repo: RepoProbe
@@ -14,6 +15,11 @@
   type ClassRow = { uri: string; short: string; n: number; titles: string[] }
 
   let classes = $state<ClassRow[]>([])
+  // Counts come from the layout, not from a second query of its own. The
+  // census and the picture have to be answering the same question: run
+  // separately they disagreed on screen — "File 68" in the legend against
+  // "File 135" in the table, both correct, nothing saying why.
+  let census = $state<{ file_subjects: number; folded_files: number; unbridged_things: number } | null>(null)
   let planes = $state<{
     fileLinks: number
     fileLinksResolved: number
@@ -39,8 +45,11 @@
     loading = true
     err = null
     try {
-      const [cls, fl, flr, th, br, te, sr, lit] = await Promise.all([
-        sparql<{ t: string; n: string }>(genesis, Q.classCounts),
+      const layoutMeta = fetch(`/api/layout/${genesis}`).then((r) =>
+        r.ok ? r.json() : null,
+      )
+      const [lm, fl, flr, th, br, te, sr, lit] = await Promise.all([
+        layoutMeta,
         sparql<{ n: string }>(genesis, Q.fileLinkCount),
         sparql<{ n: string }>(genesis, Q.fileLinkResolved),
         sparql<{ n: string }>(genesis, Q.thingCount),
@@ -60,22 +69,37 @@
         literalRefs: lit.map((r) => ({ p: short(r.p), n: Number(r.n) })),
       }
 
+      census = lm
+        ? {
+            file_subjects: lm.file_subjects,
+            folded_files: lm.folded_files,
+            unbridged_things: lm.unbridged_things,
+          }
+        : null
+
       // Titles are fetched per class, through the both-planes query. Slower
       // than one big query, but it keeps each class's sample honest rather
       // than letting one chatty class fill the sample for all of them.
-      const rows = await Promise.all(
-        cls.map(async (c) => {
+      const src: { uri: string; name: string; count: number }[] = lm
+        ? lm.classes
+        : (await sparql<{ t: string; n: string }>(genesis, Q.classCounts)).map((c) => ({
+            uri: c.t,
+            name: short(c.t),
+            count: Number(c.n),
+          }))
+
+      classes = await Promise.all(
+        src.map(async (c) => {
           let titles: string[] = []
           try {
-            const t = await sparql<{ label: string }>(genesis, Q.titlesFor(c.t))
+            const t = await sparql<{ label: string }>(genesis, Q.titlesFor(c.uri))
             titles = t.map((x) => x.label).filter(Boolean)
           } catch {
             /* a class with no reachable titles is a real answer, not a failure */
           }
-          return { uri: c.t, short: short(c.t), n: Number(c.n), titles }
+          return { uri: c.uri, short: c.name, n: c.count, titles }
         }),
       )
-      classes = rows
     } catch (e) {
       err = e instanceof Error ? e.message : String(e)
     } finally {
@@ -187,6 +211,11 @@
     </section>
 
     <section>
+      <h2>The whole soul</h2>
+      <Spiral {genesis} />
+    </section>
+
+    <section>
       <h2>What is in it</h2>
       <div class="scroll-x">
         <table>
@@ -210,6 +239,23 @@
           </tbody>
         </table>
       </div>
+      {#if census}
+        <p class="note">
+          These are <em>documents</em>, after a Thing and the file it speaks
+          through have been folded into one. The store holds
+          <strong>{census.file_subjects}</strong> files;
+          <strong>{census.folded_files}</strong> of them carry a Thing and are
+          counted under that Thing's class, which is why "File only" is the
+          smaller number and not a contradiction.
+          {#if census.unbridged_things > 0}
+            <strong>{census.unbridged_things}</strong>
+            {census.unbridged_things === 1 ? 'Thing names a file' : 'Things name files'}
+            that {census.unbridged_things === 1 ? 'is' : 'are'} not in the node
+            set; {census.unbridged_things === 1 ? 'it is' : 'they are'} drawn
+            under {census.unbridged_things === 1 ? 'its' : 'their'} own class.
+          {/if}
+        </p>
+      {/if}
       <p class="note">
         Names are resolved across both planes. A document whose frontmatter says
         <code>title:</code> rather than <code>soul.Note.title:</code> carries
