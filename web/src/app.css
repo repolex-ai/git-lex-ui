@@ -1,0 +1,56 @@
+/* Black on white, strong type, nothing decorative that isn't carrying data.
+   American Typewriter for display; monospace everywhere a value lives, so
+   numbers and hashes line up in a column and a wrong one looks wrong. */
+
+:root {
+  --ink: #111;
+  --ink-soft: #555;
+  --ink-faint: #8a8a8a;
+  --rule: #e3e3e3;
+  --rule-strong: #111;
+  --paper: #fff;
+  --paper-tint: #f7f7f5;
+  --live: #1a7f4b;
+  --warn: #a8620a;
+  --dead: #9b1c1c;
+
+  --display: 'American Typewriter', 'Courier New', Courier, serif;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app { min-height: 100%; }
+
+h1, h2, h3 { font-family: var(--display); font-weight: 400; margin: 0; }
+
+a { color: inherit; }
+
+button {
+  font: inherit;
+  font-family: var(--mono);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: var(--ink); color: var(--paper); }
+button:disabled { opacity: 0.35; cursor: default; }
+
+/* Wide content scrolls inside its own box; the page itself never does. */
+.scroll-x { overflow-x: auto; }

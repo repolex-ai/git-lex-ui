@@ -1,0 +1,479 @@
+//! Starting and watching the per-repo `git lex serve viz` processes.
+//!
+//! Three things about the child process shape this whole module, and all
+//! three were read out of `git-lex/src/bin/git-lex-serve.rs` rather than
+//! assumed.
+//!
+//! **1. It takes no `--repo`.** The only flag is `--port`. The child resolves
+//! which repository it is serving by calling `find_git_root()` on its own
+//! working directory. So the repo is selected by `current_dir` on the spawn,
+//! and getting that wrong does not error — it silently serves a different
+//! repo, or the one this binary is running from.
+//!
+//! **2. It picks its own port.** Given `--port N` it walks `N..N+20` and
+//! binds the first that is free, printing `Port N was taken, using M
+//! instead`. So the port we asked for is *not* the port we got, and in a
+//! machine with sixteen souls and a live registry the race window is real.
+//! We therefore never assume: we read the port back off the child's stdout,
+//! and then we verify the identity of what answered.
+//!
+//! **3. It is reached directly, never through `git lex serve`.** That
+//! wrapper is three processes deep — `git` to `git-lex` to `git-lex-serve` —
+//! and only the innermost one binds the port. See the spawn site.
+//!
+//! **4. It opens a browser.** The child calls `open::that_detached(url)` on
+//! startup. Harmless when a human runs one by hand; a tab storm when a
+//! supervisor starts several. See `browser_suppressing_path`.
+//!
+//! The identity check is the load-bearing part. A supervisor that remembers
+//! it started a server on port 7901 and later finds *something* answering on
+//! 7901 has learned nothing — on 2026-08-27 two dev servers exited between
+//! one message and the next while the page kept rendering the last data it
+//! had and looked entirely fine. Health is asked, never remembered, and
+//! "asked" means asking *who are you*, not *are you up*.
+
+use crate::repo::RepoProbe;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::RwLock;
+
+/// The `repo` named graph the child serves, which carries `gl:genesisSha`.
+const REPO_GRAPH: &str = "https://repolex.ai/git-lex/NamedGraph/repo";
+const GL_GENESIS: &str = "https://repolex.ai/ontology/git-lex/genesisSha";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerState {
+    /// Spawned; has not yet announced a port.
+    Starting,
+    /// Answering, and it answered with the genesis sha we expected.
+    Ready,
+    /// Answering, but it is not the repo we meant to start. Never proxied.
+    IdentityMismatch,
+    /// Was ready, is not answering now.
+    Unreachable,
+    /// The process exited.
+    Exited,
+    /// Never got off the ground.
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerStatus {
+    pub path: String,
+    pub genesis_sha: Option<String>,
+    pub state: ServerState,
+    /// The port the child actually bound, read from its own output. `None`
+    /// until it says.
+    pub port: Option<u16>,
+    /// The port we asked for, kept so a walk is visible rather than silent.
+    pub requested_port: u16,
+    pub pid: Option<u32>,
+    /// Where the child is serving its frontend from. A repo can be serving a
+    /// stale copy of the UI, and that should be visible, not a mystery.
+    pub www_dir: Option<String>,
+    /// Millis since the epoch of the last successful identity-checked probe.
+    pub last_seen_ms: Option<u128>,
+    pub message: Option<String>,
+}
+
+pub struct Supervisor {
+    servers: RwLock<HashMap<String, ServerStatus>>,
+    children: RwLock<HashMap<String, Child>>,
+    http: reqwest::Client,
+    /// A PATH with a no-op `open` in front, so children cannot spawn browser
+    /// tabs. Built once at startup.
+    child_path: Option<String>,
+    port_floor: u16,
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+impl Supervisor {
+    pub fn new(port_floor: u16, cache_dir: &std::path::Path) -> Arc<Self> {
+        Arc::new(Self {
+            servers: RwLock::new(HashMap::new()),
+            children: RwLock::new(HashMap::new()),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .unwrap_or_default(),
+            child_path: browser_suppressing_path(cache_dir),
+            port_floor,
+        })
+    }
+
+    pub async fn status_all(&self) -> Vec<ServerStatus> {
+        let mut v: Vec<_> = self.servers.read().await.values().cloned().collect();
+        v.sort_by(|a, b| a.path.cmp(&b.path));
+        v
+    }
+
+    pub async fn status_of(&self, path: &str) -> Option<ServerStatus> {
+        self.servers.read().await.get(path).cloned()
+    }
+
+    /// The port to proxy to, but only for a server that is Ready. An
+    /// unreachable or mismatched server yields nothing, so a stale page gets
+    /// a real error instead of somebody else's data.
+    pub async fn proxy_port(&self, path: &str) -> Option<u16> {
+        let s = self.servers.read().await;
+        let st = s.get(path)?;
+        if st.state == ServerState::Ready { st.port } else { None }
+    }
+
+    /// Start a server for a repo, or return the existing one if it is
+    /// genuinely still answering as the right repo.
+    pub async fn ensure(self: &Arc<Self>, repo: &RepoProbe) -> ServerStatus {
+        if let Some(existing) = self.servers.read().await.get(&repo.path).cloned() {
+            if existing.state == ServerState::Ready {
+                // Do not trust the record. Ask.
+                if let Some(port) = existing.port {
+                    if self.verify(port, repo.genesis_sha.as_deref()).await.is_ok() {
+                        return existing;
+                    }
+                }
+            }
+        }
+        self.spawn(repo).await
+    }
+
+    async fn spawn(self: &Arc<Self>, repo: &RepoProbe) -> ServerStatus {
+        let requested = self.pick_port().await;
+        let mut status = ServerStatus {
+            path: repo.path.clone(),
+            genesis_sha: repo.genesis_sha.clone(),
+            state: ServerState::Starting,
+            port: None,
+            requested_port: requested,
+            pid: None,
+            www_dir: None,
+            last_seen_ms: None,
+            message: None,
+        };
+        self.servers
+            .write()
+            .await
+            .insert(repo.path.clone(), status.clone());
+
+        // Spawn `git-lex-serve` directly, NOT `git lex serve viz`.
+        //
+        // Measured 2026-09-01: `git lex serve viz` is a three-deep chain —
+        // `git` execs `git-lex`, which spawns `git-lex-serve`, which is the
+        // process that actually binds the port. Killing what we spawned
+        // killed the outermost wrapper and left the real server listening,
+        // still answering, with our supervisor reporting it as `ready`
+        // because it genuinely was. A stop that does not stop, and a death
+        // detector watching a pipe the surviving grandchild still holds
+        // open — the exact shape of the failure this module exists to
+        // prevent, reproduced inside the module preventing it.
+        //
+        // `git-lex-serve` ships as its own binary on PATH beside `git-lex`,
+        // so there is no wrapper to own. One process, one pid, one stdout.
+        let mut cmd = Command::new("git-lex-serve");
+        cmd.arg("viz")
+            .arg("--port")
+            .arg(requested.to_string())
+            // The child identifies its repo by its own cwd. This line is the
+            // entire repo selection mechanism.
+            .current_dir(&repo.path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(p) = &self.child_path {
+            cmd.env("PATH", p);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                status.state = ServerState::Failed;
+                status.message = Some(format!("could not start git-lex-serve: {e}"));
+                self.servers
+                    .write()
+                    .await
+                    .insert(repo.path.clone(), status.clone());
+                return status;
+            }
+        };
+        status.pid = child.id();
+
+        let stdout = child.stdout.take();
+        self.children
+            .write()
+            .await
+            .insert(repo.path.clone(), child);
+        self.servers
+            .write()
+            .await
+            .insert(repo.path.clone(), status.clone());
+
+        // Read the port back out of the child rather than assuming the one we
+        // asked for. This is the whole defence against the port walk.
+        let announced = match stdout {
+            Some(out) => read_announcement(out, repo.path.clone(), Arc::clone(self)).await,
+            None => None,
+        };
+
+        let mut status = self
+            .servers
+            .read()
+            .await
+            .get(&repo.path)
+            .cloned()
+            .unwrap_or(status);
+
+        let Some((port, www)) = announced else {
+            status.state = ServerState::Failed;
+            status.message =
+                Some("the server started but never announced a port".to_string());
+            self.servers
+                .write()
+                .await
+                .insert(repo.path.clone(), status.clone());
+            return status;
+        };
+
+        status.port = Some(port);
+        status.www_dir = www;
+        if port != requested {
+            status.message = Some(format!(
+                "asked for port {requested}, the server took {port} — {requested} was in use"
+            ));
+        }
+
+        match self.verify(port, repo.genesis_sha.as_deref()).await {
+            Ok(()) => {
+                status.state = ServerState::Ready;
+                status.last_seen_ms = Some(now_ms());
+            }
+            Err(why) => {
+                status.state = ServerState::IdentityMismatch;
+                status.message = Some(why);
+            }
+        }
+        self.servers
+            .write()
+            .await
+            .insert(repo.path.clone(), status.clone());
+        status
+    }
+
+    /// Ask the server on `port` which repo it is, and compare.
+    ///
+    /// `expected` of `None` means the repo itself has no commits and so has
+    /// no identity to check against; we accept whatever answers and say so
+    /// rather than pretending we verified something.
+    async fn verify(&self, port: u16, expected: Option<&str>) -> Result<(), String> {
+        let q = format!(
+            "SELECT ?sha WHERE {{ GRAPH <{REPO_GRAPH}> {{ ?s <{GL_GENESIS}> ?sha }} }} LIMIT 1"
+        );
+        let url = format!("http://127.0.0.1:{port}/api/query");
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "query": q }))
+            .send()
+            .await
+            .map_err(|e| format!("no answer from port {port}: {e}"))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("port {port} answered with something unparseable: {e}"))?;
+        let got = body
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|r| r.get("sha"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+
+        match (expected, got) {
+            (Some(want), Some(have)) if want == have => Ok(()),
+            (Some(want), Some(have)) => Err(format!(
+                "port {port} is serving a different repo — expected genesis {}, got {}",
+                &want[..want.len().min(8)],
+                &have[..have.len().min(8)]
+            )),
+            (Some(_), None) => {
+                Err(format!("port {port} did not report a genesis sha"))
+            }
+            (None, _) => Ok(()),
+        }
+    }
+
+    /// Re-probe every server we believe is up. Called on a timer and by the
+    /// status endpoint, so a page that has been open for an hour finds out
+    /// its server died rather than continuing to look fine.
+    pub async fn refresh_health(&self) {
+        let snapshot: Vec<ServerStatus> = self.servers.read().await.values().cloned().collect();
+        for st in snapshot {
+            let Some(port) = st.port else { continue };
+            if matches!(st.state, ServerState::Failed | ServerState::Exited) {
+                continue;
+            }
+            let ok = self.verify(port, st.genesis_sha.as_deref()).await;
+            let mut servers = self.servers.write().await;
+            if let Some(cur) = servers.get_mut(&st.path) {
+                match ok {
+                    Ok(()) => {
+                        cur.state = ServerState::Ready;
+                        cur.last_seen_ms = Some(now_ms());
+                        cur.message = None;
+                    }
+                    Err(why) => {
+                        cur.state = if why.contains("different repo") {
+                            ServerState::IdentityMismatch
+                        } else {
+                            ServerState::Unreachable
+                        };
+                        cur.message = Some(why);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn stop(&self, path: &str) -> bool {
+        let child = self.children.write().await.remove(path);
+        let stopped = match child {
+            Some(mut c) => c.kill().await.is_ok(),
+            None => false,
+        };
+        if let Some(st) = self.servers.write().await.get_mut(path) {
+            st.state = ServerState::Exited;
+            st.port = None;
+            st.message = Some("stopped".to_string());
+        }
+        stopped
+    }
+
+    pub async fn stop_all(&self) {
+        let paths: Vec<String> = self.children.read().await.keys().cloned().collect();
+        for p in paths {
+            self.stop(&p).await;
+        }
+    }
+
+    /// Find a port that is free *right now*, starting from the floor and
+    /// skipping the +20 window each child may walk into, so two children
+    /// started back to back cannot land on each other's range.
+    async fn pick_port(&self) -> u16 {
+        let taken: Vec<u16> = self
+            .servers
+            .read()
+            .await
+            .values()
+            .filter_map(|s| s.port.or(Some(s.requested_port)))
+            .collect();
+        let mut candidate = self.port_floor;
+        while candidate < u16::MAX - 20 {
+            let clashes = taken.iter().any(|t| candidate.abs_diff(*t) < 20);
+            if !clashes && tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await.is_ok() {
+                return candidate;
+            }
+            candidate = candidate.saturating_add(20);
+        }
+        self.port_floor
+    }
+}
+
+/// Consume the child's stdout, returning the port and www directory it
+/// announces, then keep draining in the background so a chatty child never
+/// blocks on a full pipe.
+async fn read_announcement(
+    stdout: tokio::process::ChildStdout,
+    path: String,
+    sup: Arc<Supervisor>,
+) -> Option<(u16, Option<String>)> {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut port: Option<u16> = None;
+    let mut www: Option<String> = None;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
+        let line = match next {
+            Err(_) => break,             // timed out waiting for it to speak
+            Ok(Ok(Some(l))) => l,
+            Ok(Ok(None)) => break,       // stdout closed: the child exited
+            Ok(Err(_)) => break,
+        };
+        if let Some(p) = parse_listening_port(&line) {
+            port = Some(p);
+        }
+        if let Some(rest) = line.strip_prefix("Serving assets from ") {
+            www = Some(rest.trim().to_string());
+        }
+        if port.is_some() && www.is_some() {
+            break;
+        }
+    }
+
+    // Keep reading in the background, and notice when the pipe closes —
+    // that is the process exiting, which is the event a page needs to see.
+    tokio::spawn(async move {
+        while let Ok(Some(_)) = lines.next_line().await {}
+        if let Some(st) = sup.servers.write().await.get_mut(&path) {
+            if st.state != ServerState::Exited {
+                st.state = ServerState::Exited;
+                st.port = None;
+                st.message = Some("the server process exited".to_string());
+            }
+        }
+    });
+
+    port.map(|p| (p, www))
+}
+
+/// `git-lex-serve viz listening on http://127.0.0.1:7901`
+fn parse_listening_port(line: &str) -> Option<u16> {
+    let idx = line.find("127.0.0.1:")?;
+    let tail = &line[idx + "127.0.0.1:".len()..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Build a PATH whose first entry holds a no-op `open`.
+///
+/// `git-lex-serve` calls `open::that_detached(url)` when it starts, which on
+/// macOS shells out to `open` resolved through PATH. That is a nice touch for
+/// a human starting one server; for a front door that may start a dozen it is
+/// a dozen browser tabs nobody asked for. Shadowing the binary is the least
+/// invasive fix available from outside git-lex — it changes nothing about the
+/// child except that its one browser call does nothing.
+///
+/// Returns `None` if the shim cannot be created, in which case children keep
+/// their original behaviour rather than failing to start.
+fn browser_suppressing_path(cache_dir: &std::path::Path) -> Option<String> {
+    let shim_dir = cache_dir.join("shim");
+    std::fs::create_dir_all(&shim_dir).ok()?;
+    let shim = shim_dir.join("open");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n# git-lex-ui: swallow the child server's browser launch.\nexit 0\n",
+    )
+    .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    let existing = std::env::var("PATH").unwrap_or_default();
+    Some(format!("{}:{}", shim_dir.display(), existing))
+}
+
+/// Where the shim lives, for the status endpoint to disclose.
+pub fn shim_dir(cache_dir: &std::path::Path) -> PathBuf {
+    cache_dir.join("shim")
+}
