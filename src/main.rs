@@ -181,6 +181,14 @@ async fn main() {
     println!("git-lex-ui listening on {url}");
     println!("Frontend served from {}", web_dir.display());
     println!("Registry: {}", lex_dir.join("repos.*").display());
+    // Say which guard is in force. A suppression that silently does nothing
+    // is how every click in this UI ended up also opening the old viewer.
+    match sup.guard() {
+        supervisor::BrowserGuard::None => eprintln!(
+            "WARNING: child servers will open a browser tab each — no way to suppress it on this machine"
+        ),
+        g => println!("Child browser launch suppressed by {}", g.describe()),
+    }
     if !args.no_open {
         let _ = open::that_detached(&url);
     }
@@ -389,7 +397,7 @@ async fn api_health(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "web_dir": s.web_dir.display().to_string(),
         "web_dir_present": s.web_dir.is_dir(),
         "cache_dir": s.cache_dir.display().to_string(),
-        "browser_shim": supervisor::shim_dir(&s.cache_dir).join("open").display().to_string(),
+        "browser_guard": s.sup.guard().describe(),
     }))
 }
 

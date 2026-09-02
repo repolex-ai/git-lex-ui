@@ -77,6 +77,17 @@ Measured 2026-09-01 against the live registry, not assumed:
 - That server **picks its own port**, walking up to 20 from the one it is
   given. So the port is read back off its stdout, and then the identity of
   whatever answered is verified against the expected genesis sha.
+- That server also **opens a browser tab on startup and has no flag to stop
+  it**, so every soul opened here used to also open the old viewer — which
+  reads as this UI linking back to the old one. Suppressed per platform, and
+  the guard in force is printed at startup and reported by `/api/health`,
+  because the first attempt at this (a no-op `open` first on PATH) looked
+  right and did nothing: on macOS the call is to `/usr/bin/open` by absolute
+  path, which PATH cannot shadow.
+
+Nothing of the old interface is reachable through this server. The proxy
+forwards `/r/<genesis>/api/…` only; the old page, its script and its
+stylesheet all return 404.
 
 ## What it does not do
 

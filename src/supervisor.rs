@@ -21,9 +21,12 @@
 //! wrapper is three processes deep — `git` to `git-lex` to `git-lex-serve` —
 //! and only the innermost one binds the port. See the spawn site.
 //!
-//! **4. It opens a browser.** The child calls `open::that_detached(url)` on
-//! startup. Harmless when a human runs one by hand; a tab storm when a
-//! supervisor starts several. See `browser_suppressing_path`.
+//! **4. It opens a browser, and it cannot be told not to.** The child calls
+//! `open::that_detached(url)` on startup with no flag to disable it.
+//! Harmless when a human runs one by hand; when a supervisor starts one per
+//! soul, every click in this UI also opens a tab showing the OLD viewer,
+//! which looks exactly like the new interface linking back to the old one.
+//! See `BrowserGuard`.
 //!
 //! The identity check is the load-bearing part. A supervisor that remembers
 //! it started a server on port 7901 and later finds *something* answering on
@@ -35,7 +38,7 @@
 use crate::repo::RepoProbe;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -90,9 +93,9 @@ pub struct Supervisor {
     servers: RwLock<HashMap<String, ServerStatus>>,
     children: RwLock<HashMap<String, Child>>,
     http: reqwest::Client,
-    /// A PATH with a no-op `open` in front, so children cannot spawn browser
-    /// tabs. Built once at startup.
-    child_path: Option<String>,
+    /// How children are stopped from opening browser tabs. Chosen once at
+    /// startup and reported, never assumed.
+    guard: BrowserGuard,
     port_floor: u16,
     /// Where the pids of live children are recorded, so a supervisor that is
     /// killed rather than shut down can find them again next time.
@@ -115,10 +118,14 @@ impl Supervisor {
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default(),
-            child_path: browser_suppressing_path(cache_dir),
+            guard: choose_browser_guard(cache_dir),
             port_floor,
             persist_path: cache_dir.join("children.json"),
         })
+    }
+
+    pub fn guard(&self) -> &BrowserGuard {
+        &self.guard
     }
 
     pub async fn status_all(&self) -> Vec<ServerStatus> {
@@ -157,6 +164,29 @@ impl Supervisor {
     }
 
     async fn spawn(self: &Arc<Self>, repo: &RepoProbe) -> ServerStatus {
+        let st = self.spawn_once(repo, true).await;
+        // `sandbox-exec` is deprecated on macOS. If it ever stops working,
+        // a browser tab is a far smaller problem than a front door that
+        // cannot open anything — so fall back, once, and say so.
+        if st.state == ServerState::Failed && matches!(self.guard, BrowserGuard::Sandbox(_)) {
+            eprintln!(
+                "sandbox-exec could not start the server for {}; retrying unguarded — expect a browser tab",
+                repo.path
+            );
+            let mut retried = self.spawn_once(repo, false).await;
+            if retried.state == ServerState::Ready {
+                retried.message = Some(
+                    "started without the browser guard — sandbox-exec failed, so this one opened a tab"
+                        .to_string(),
+                );
+                self.servers.write().await.insert(repo.path.clone(), retried.clone());
+            }
+            return retried;
+        }
+        st
+    }
+
+    async fn spawn_once(self: &Arc<Self>, repo: &RepoProbe, guarded: bool) -> ServerStatus {
         let requested = self.pick_port().await;
         let mut status = ServerStatus {
             path: repo.path.clone(),
@@ -189,7 +219,17 @@ impl Supervisor {
         //
         // `git-lex-serve` ships as its own binary on PATH beside `git-lex`,
         // so there is no wrapper to own. One process, one pid, one stdout.
-        let mut cmd = Command::new("git-lex-serve");
+        let mut cmd = match (&self.guard, guarded) {
+            // Deny the one exec, keep everything else. The crate does not
+            // check whether its browser launch succeeded, so the server
+            // starts normally.
+            (BrowserGuard::Sandbox(profile), true) => {
+                let mut c = Command::new("sandbox-exec");
+                c.arg("-f").arg(profile).arg("git-lex-serve");
+                c
+            }
+            _ => Command::new("git-lex-serve"),
+        };
         cmd.arg("viz")
             .arg("--port")
             .arg(requested.to_string())
@@ -199,8 +239,13 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(p) = &self.child_path {
-            cmd.env("PATH", p);
+        if guarded && matches!(self.guard, BrowserGuard::Flag) {
+            cmd.arg("--no-open");
+        }
+        if guarded {
+            if let BrowserGuard::PathShim(p) = &self.guard {
+                cmd.env("PATH", p);
+            }
         }
 
         let mut child = match cmd.spawn() {
@@ -566,26 +611,119 @@ fn parse_listening_port(line: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-/// Build a PATH whose first entry holds a no-op `open`.
+/// How a child is stopped from opening a browser tab.
 ///
-/// `git-lex-serve` calls `open::that_detached(url)` when it starts, which on
-/// macOS shells out to `open` resolved through PATH. That is a nice touch for
-/// a human starting one server; for a front door that may start a dozen it is
-/// a dozen browser tabs nobody asked for. Shadowing the binary is the least
-/// invasive fix available from outside git-lex — it changes nothing about the
-/// child except that its one browser call does nothing.
+/// `git-lex-serve` calls `open::that_detached(url)` unconditionally at
+/// startup and offers no flag to suppress it. That is fine for a human
+/// starting one server; here it means every soul opened in this UI also
+/// throws up a tab showing the old viewer.
 ///
-/// Returns `None` if the shim cannot be created, in which case children keep
-/// their original behaviour rather than failing to start.
-fn browser_suppressing_path(cache_dir: &std::path::Path) -> Option<String> {
+/// The obvious fix — put a no-op `open` first on the child's PATH — does
+/// nothing on macOS, and this was measured rather than assumed: the `open`
+/// crate's macOS backend is `Command::new("/usr/bin/open")`, an absolute
+/// path that PATH cannot shadow. The shim was in place and Chrome still went
+/// from six tabs to seven, the new one pointing at `127.0.0.1:7995`. A
+/// suppression that looks plausible and does nothing is worse than none,
+/// because nobody goes back to check it.
+///
+/// So the guard is chosen per platform, and which rung is in use is reported
+/// rather than assumed to have worked.
+#[derive(Debug, Clone)]
+pub enum BrowserGuard {
+    /// The binary grew a `--no-open` flag. Preferred whenever present: it is
+    /// the child agreeing not to, rather than the parent preventing it.
+    Flag,
+    /// macOS: run the child under a sandbox profile that denies exactly one
+    /// thing — executing `/usr/bin/open`. The crate ignores the failed
+    /// launch (`let _ = open::that_detached(..)`), so the server carries on.
+    Sandbox(PathBuf),
+    /// Other unix: the PATH shim genuinely works, because there the crate
+    /// resolves `xdg-open`/`gio`/`gnome-open` through PATH.
+    PathShim(String),
+    /// Nothing available. Tabs will open, and we say so loudly instead of
+    /// leaving it to be discovered.
+    None,
+}
+
+impl BrowserGuard {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            BrowserGuard::Flag => "the server's own --no-open flag",
+            BrowserGuard::Sandbox(_) => "a sandbox profile denying /usr/bin/open",
+            BrowserGuard::PathShim(_) => "a no-op `open` first on PATH",
+            BrowserGuard::None => "NOTHING — child servers will open browser tabs",
+        }
+    }
+}
+
+/// Pick the strongest guard this machine and this binary support.
+pub fn choose_browser_guard(cache_dir: &Path) -> BrowserGuard {
+    if serve_supports_no_open() {
+        return BrowserGuard::Flag;
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(profile) = write_sandbox_profile(cache_dir) {
+            if which("sandbox-exec") {
+                return BrowserGuard::Sandbox(profile);
+            }
+        }
+        // The PATH shim is known not to work here, so do not pretend.
+        return BrowserGuard::None;
+    }
+    match path_shim(cache_dir) {
+        Some(p) => BrowserGuard::PathShim(p),
+        None => BrowserGuard::None,
+    }
+}
+
+fn which(bin: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ask the binary whether it takes `--no-open`, so a future git-lex that
+/// grows the flag is used properly without changing anything here.
+fn serve_supports_no_open() -> bool {
+    std::process::Command::new("git-lex-serve")
+        .arg("viz")
+        .arg("--help")
+        .output()
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr);
+            text.contains("--no-open")
+        })
+        .unwrap_or(false)
+}
+
+/// `(allow default)` then one deny: the child keeps every other capability it
+/// had, including binding its port and reading the store. A broad sandbox
+/// would be a much bigger promise than "do not open a browser".
+fn write_sandbox_profile(cache_dir: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(cache_dir).ok()?;
+    let p = cache_dir.join("no-browser.sb");
+    std::fs::write(
+        &p,
+        "(version 1)\n\
+         ;; git-lex-ui: the child server opens a browser tab on startup and has\n\
+         ;; no flag to disable it. Deny that one exec and nothing else.\n\
+         (allow default)\n\
+         (deny process-exec* (literal \"/usr/bin/open\"))\n",
+    )
+    .ok()?;
+    Some(p)
+}
+
+fn path_shim(cache_dir: &Path) -> Option<String> {
     let shim_dir = cache_dir.join("shim");
     std::fs::create_dir_all(&shim_dir).ok()?;
     let shim = shim_dir.join("open");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n# git-lex-ui: swallow the child server's browser launch.\nexit 0\n",
-    )
-    .ok()?;
+    std::fs::write(&shim, "#!/bin/sh\n# git-lex-ui: swallow the browser launch.\nexit 0\n").ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -595,7 +733,4 @@ fn browser_suppressing_path(cache_dir: &std::path::Path) -> Option<String> {
     Some(format!("{}:{}", shim_dir.display(), existing))
 }
 
-/// Where the shim lives, for the status endpoint to disclose.
-pub fn shim_dir(cache_dir: &std::path::Path) -> PathBuf {
-    cache_dir.join("shim")
-}
+
