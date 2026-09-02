@@ -101,12 +101,13 @@ pub async fn build_from_server(
         serde_json::from_value(arr).map_err(|e| e.to_string())
     }
 
-    let (nodes, edges, aliases, born, dates) = tokio::join!(
+    let (nodes, edges, aliases, born, dates, labels) = tokio::join!(
         rows::<layout::NodeRow>(http, format!("{base}/api/viz/nodes")),
         rows::<layout::EdgeRow>(http, format!("{base}/api/viz/edges")),
         query::<layout::AliasRow>(http, &base, layout::q_alias()),
         query::<layout::BornRow>(http, &base, layout::q_born()),
         query::<layout::DateRow>(http, &base, layout::q_dates()),
+        query::<layout::LabelRow>(http, &base, layout::q_labels()),
     );
 
     let nodes = nodes?;
@@ -125,5 +126,6 @@ pub async fn build_from_server(
         aliases.unwrap_or_default(),
         born.unwrap_or_default(),
         dates.unwrap_or_default(),
+        labels.unwrap_or_default(),
     ))
 }

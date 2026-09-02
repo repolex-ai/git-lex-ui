@@ -22,6 +22,28 @@ In development, `cd web && npm run dev` serves the frontend on 5173 and
 forwards `/api` and `/r` to the Rust process on 8888, so the URLs are the
 same in development as in a build.
 
+## The interface
+
+Three fixed zones. The rails keep their home and their width; the stage takes
+what is left. Nothing opens over the graph or moves when the state changes.
+
+- **Left** — every soul on the machine, the view switcher, a search box, and
+  the class list with per-class counts. Classes toggle; a class switched off
+  is genuinely removed from the stage, not merely faded, because a filter that
+  leaves things pickable is a filter you cannot trust.
+- **Centre** — the graph. *Whole soul* lays documents out on a spiral where
+  angle is time. *Neighbourhood* puts one document at the centre and rings its
+  links by hop distance — deliberately not a force simulation, because "what
+  is this connected to, and how far away" has an exact answer that should not
+  wobble or settle differently on a second look.
+- **Right** — the selected document: its class, birth commit, change count,
+  its links in and out, and **every triple that mentions it, on both planes**.
+  Object URIs are clickable, including declared references that point at a
+  Thing rather than at its file.
+
+A soul is addressed by its genesis sha and a document by its URI, so
+`/?doc=<uri>#<genesis>` is a durable link to one row in one soul.
+
 ## How it is put together
 
 The browser only ever talks to this process. Per-repo `git-lex-serve`

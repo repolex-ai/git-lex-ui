@@ -62,6 +62,42 @@ pub fn q_born() -> String {
     )
 }
 
+/// Resolve every document's NAME, across both planes.
+///
+/// This is commit 2ebd895 carried forward, and it has to live here because
+/// `/api/viz/nodes` returns each node's **slug**, not its title — so a view
+/// built on that endpoint alone renders documents as identifiers, which is
+/// exactly the behaviour that made souls show as hex strings for eight
+/// months.
+///
+/// Four branches, because a title can be in four places. An unqualified
+/// frontmatter key (`title:` rather than `soul.Note.title:`) cannot bind to a
+/// class property, so git-lex emits it under the `fm/` fallback namespace
+/// attached to the FILE subject — never to the Thing. Asking a Thing for
+/// `fm:title` therefore matches nothing every time. Measured on W3BL0RD: 33
+/// `fm:title` against 4 `gl:title`, and `gl:name` on exactly one subject in
+/// the whole store, so roughly 89% of the titles that exist were unreachable
+/// from the plane the query ran on.
+///
+/// A real Thing-plane name still wins where one exists; the file hop is a
+/// fallback, not a replacement.
+pub fn q_labels() -> String {
+    format!(
+        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
+         SELECT ?s ?label ?rank WHERE {{
+             GRAPH <{NOW}> {{
+                 {{ ?s gl:name ?label . BIND(1 AS ?rank) }}
+                 UNION
+                 {{ ?s gl:title ?label . BIND(2 AS ?rank) }}
+                 UNION
+                 {{ ?s <https://repolex.ai/ontology/git-lex/fm/title> ?label . BIND(3 AS ?rank) }}
+                 UNION
+                 {{ ?s gl:fileId ?f . ?f <https://repolex.ai/ontology/git-lex/fm/title> ?label . BIND(4 AS ?rank) }}
+             }}
+         }}"
+    )
+}
+
 /// Two anchors and a direction is all an axis needs. Without dates the ticks
 /// can say a turn closed but nothing about when.
 pub fn q_dates() -> String {
@@ -141,6 +177,10 @@ pub struct LayoutMeta {
     /// Things whose `gl:fileId` names a file that is not itself in the node
     /// set. They are still drawn, under their own class.
     pub unbridged_things: usize,
+    /// How many documents got a real title rather than falling back to their
+    /// slug. Printed, because "titles are resolved" is a claim and this is
+    /// its test.
+    pub titled: usize,
     pub dropped: Vec<Dropped>,
     /// Byte offsets into the companion binary payload.
     pub offsets: Offsets,
@@ -200,6 +240,13 @@ pub struct BornRow {
 }
 
 #[derive(serde::Deserialize)]
+pub struct LabelRow {
+    pub s: String,
+    pub label: String,
+    pub rank: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct DateRow {
     pub ord: String,
     pub when: String,
@@ -252,7 +299,18 @@ pub fn build(
     aliases: Vec<AliasRow>,
     born_rows: Vec<BornRow>,
     date_rows: Vec<DateRow>,
+    label_rows: Vec<LabelRow>,
 ) -> Layout {
+    // Best title per subject: lowest rank wins, so a declared Thing-plane
+    // name beats a file-plane one.
+    let mut best_label: HashMap<&str, (u8, &str)> = HashMap::new();
+    for r in &label_rows {
+        let rank: u8 = r.rank.parse().unwrap_or(9);
+        let e = best_label.entry(r.s.as_str()).or_insert((rank, r.label.as_str()));
+        if rank < e.0 {
+            *e = (rank, r.label.as_str());
+        }
+    }
     // --- fold the Thing plane onto the File plane -------------------------
     let file_of_thing: HashMap<&str, &str> = aliases
         .iter()
@@ -308,6 +366,7 @@ pub fn build(
         id: String,
         ty: String,
         label: String,
+        twins_have_label: bool,
         born: Option<i64>,
         events: u32,
         group_idx: usize,
@@ -326,12 +385,30 @@ pub fn build(
                 .find(|t| t.as_str() != GL_FILE)
                 .cloned()
                 .or_else(|| e.types.first().cloned())?;
-            let label = e
-                .labels
-                .get(&ty)
-                .cloned()
-                .or_else(|| e.labels.values().next().cloned())
-                .unwrap_or_else(|| short_name(&e.id));
+            // A real title, from either plane, beats the slug that
+            // `/api/viz/nodes` hands back. Checked across every twin, because
+            // the title commonly sits on the file while the type sits on the
+            // Thing.
+            let resolved = e
+                .twins
+                .iter()
+                .filter_map(|t| best_label.get(t.as_str()).map(|(r, l)| (*r, *l)))
+                .min_by_key(|(r, _)| *r)
+                .map(|(_, l)| l.to_string());
+            let resolved_present = resolved.is_some();
+            // Fall back to the FOLDED id's last segment, not to the slug that
+            // came back on the node row.
+            //
+            // These are usually the same string, and in one case they are
+            // not: SOUL.md. Its Thing is minted from the genesis sha, so its
+            // slug is a 40-character hash — and on the single document whose
+            // job is to say WHICH SOUL THIS IS, the untitled fallback
+            // rendered as `e3d71e7f0e022e54...`. That is the hex-string
+            // symptom itself, surviving the very fix that was meant to end
+            // it, on the worst possible document. The folded id is the file,
+            // so its last segment is `SOUL.md`, which is a name a person can
+            // read.
+            let label = resolved.unwrap_or_else(|| short_name(&e.id));
             // A document is as old as the earliest fact about EITHER of its
             // subjects: a Thing minted later than its File is the same
             // document arriving, not a new one.
@@ -341,7 +418,16 @@ pub fn build(
                 .iter()
                 .map(|t| events_of.get(t.as_str()).copied().unwrap_or(0))
                 .sum();
-            Some(Doc { id: e.id, ty, label, born, events, group_idx: 0, group_size: 1 })
+            Some(Doc {
+                id: e.id,
+                ty,
+                twins_have_label: resolved_present,
+                label,
+                born,
+                events,
+                group_idx: 0,
+                group_size: 1,
+            })
         })
         .collect();
 
@@ -571,6 +657,10 @@ pub fn build(
     }
 
     let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
+    let titled = docs
+        .iter()
+        .filter(|d| d.twins_have_label)
+        .count();
 
     let doc_meta: Vec<DocMeta> = docs
         .iter()
@@ -603,6 +693,7 @@ pub fn build(
             file_subjects,
             folded_files: file_subjects.saturating_sub(file_only),
             unbridged_things,
+            titled,
             dropped,
             offsets: Offsets {
                 positions: pos_at,
@@ -650,10 +741,11 @@ mod tests {
         let aliases: Vec<AliasRow> = rows(&dir, "lux_alias.json");
         let born: Vec<BornRow> = rows(&dir, "lux_born.json");
         let dates: Vec<DateRow> = rows(&dir, "lux_dates.json");
+        let labels: Vec<LabelRow> = Vec::new();
         let node_rows = nodes.len();
 
         let t0 = std::time::Instant::now();
-        let l = build("genesis", "head", nodes, edges, aliases, born, dates);
+        let l = build("genesis", "head", nodes, edges, aliases, born, dates, labels);
         let elapsed = t0.elapsed();
 
         eprintln!(
@@ -687,6 +779,7 @@ mod tests {
             rows(&dir, "lux_alias.json"),
             rows(&dir, "lux_born.json"),
             rows(&dir, "lux_dates.json"),
+            Vec::new(),
         );
         assert_eq!(l.data, l2.data, "layout is not deterministic");
     }
@@ -720,7 +813,7 @@ mod tests {
             born.push(BornRow { s: id, born: o.into(), events: "1".into() });
         }
 
-        let l = build("g", "h", nodes, vec![], vec![], born, vec![]);
+        let l = build("g", "h", nodes, vec![], vec![], born, vec![], vec![]);
         let turns = l.meta.turns as f32;
 
         // Recover each cohort member's angle and radius.

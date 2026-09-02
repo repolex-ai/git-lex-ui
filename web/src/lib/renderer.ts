@@ -1,16 +1,17 @@
 /**
- * WebGL2 renderer for the Whole Soul spiral.
+ * WebGL2 renderer for the graph stage.
  *
- * Hand-written, no charting library. Nothing off the shelf draws six
- * thousand nodes on a deterministic layout and holds a frame budget, and the
- * layout arrives already computed as typed arrays — so the browser's whole
- * job is to put them in buffers and draw. A library would be weight between
- * this and the GPU, buying nothing.
+ * Hand-written, no charting library. The layout arrives already computed as
+ * typed arrays, so the browser's job is to put them in buffers and draw.
  *
- * Positions, colours and sizes come from the server as one packed buffer and
- * are uploaded once. Pan and zoom are a uniform, not a re-upload: no per-frame
- * CPU work proportional to the node count, which is what keeps a 6,400-node
- * soul as cheap to drag as a 147-node one.
+ * Two things are dynamic and everything else is static. **Positions** are
+ * dynamic because the stage swaps between layouts — the spiral, where
+ * position means time, and a neighbourhood, where position means distance
+ * from one node. **State** is dynamic because filtering and selection change
+ * constantly and must not cost a re-upload of the whole graph.
+ *
+ * Pan and zoom are uniforms, never a re-upload: dragging a 7,300-node soul
+ * costs exactly what dragging a 147-node one costs.
  */
 
 export interface LayoutOffsets {
@@ -31,44 +32,72 @@ export interface View {
   y: number
 }
 
+/** Per-node draw state. Ordered so that a larger number draws louder. */
+export const NodeState = {
+  /** Filtered out entirely — not drawn, and not pickable. */
+  Hidden: 0,
+  /** Present but pushed back: context, not subject. */
+  Dim: 1,
+  Normal: 2,
+  /** A search or neighbourhood match. */
+  Marked: 3,
+  Selected: 4,
+} as const
+
 const POINT_VS = `#version 300 es
 in vec2 a_pos;
 in vec3 a_color;
 in float a_size;
+in float a_state;
 uniform vec2 u_offset;
 uniform float u_scale;
 uniform vec2 u_viewport;
 uniform float u_dpr;
-uniform float u_dim;
 out vec3 v_color;
-out float v_dim;
+out float v_alpha;
+out float v_ring;
 void main() {
+  if (a_state < 0.5) {
+    // Hidden: collapse to a degenerate point off-screen rather than
+    // discarding in the fragment stage, so it costs nothing downstream.
+    gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+    gl_PointSize = 0.0;
+    return;
+  }
   vec2 p = (a_pos + u_offset) * u_scale;
-  // Aspect-correct: the spiral is round, and it must stay round in a
-  // window that is not.
-  float aspect = u_viewport.x / u_viewport.y;
-  p.x /= aspect;
+  p.x /= u_viewport.x / u_viewport.y;
   gl_Position = vec4(p, 0.0, 1.0);
-  // Size grows with zoom but sub-linearly, so a zoomed-in view shows more
-  // detail rather than a screen of overlapping discs.
-  gl_PointSize = a_size * u_dpr * (0.6 + 0.4 * sqrt(u_scale));
-  v_color = a_color;
-  v_dim = u_dim;
+
+  float grow = a_state > 3.5 ? 2.1 : (a_state > 2.5 ? 1.5 : 1.0);
+  gl_PointSize = a_size * u_dpr * (0.6 + 0.4 * sqrt(u_scale)) * grow;
+
+  // Dimmed nodes keep their position and lose their voice. Washing them
+  // toward the page rather than hiding them is what keeps a filtered view
+  // honest: you can still see how much you are not looking at.
+  float dim = a_state < 1.5 ? 0.13 : 1.0;
+  v_color = mix(vec3(1.0), a_color, dim);
+  v_alpha = a_state < 1.5 ? 0.5 : 1.0;
+  v_ring = a_state > 3.5 ? 1.0 : 0.0;
 }`
 
 const POINT_FS = `#version 300 es
 precision mediump float;
 in vec3 v_color;
-in float v_dim;
+in float v_alpha;
+in float v_ring;
 out vec4 outColor;
 void main() {
-  // Round points with a soft edge. gl_PointCoord is the only cheap way to
-  // get a disc out of a square point sprite.
   vec2 d = gl_PointCoord - vec2(0.5);
   float r = length(d);
-  float a = smoothstep(0.5, 0.42, r);
+  float a = smoothstep(0.5, 0.42, r) * v_alpha;
   if (a <= 0.0) discard;
-  outColor = vec4(mix(vec3(1.0), v_color, v_dim), a);
+  // The selected node wears a ring rather than just being bigger, so it is
+  // findable in a field of thousands of dots that are also big.
+  if (v_ring > 0.5 && r > 0.34 && r < 0.46) {
+    outColor = vec4(0.05, 0.05, 0.05, a);
+    return;
+  }
+  outColor = vec4(v_color, a);
 }`
 
 const LINE_VS = `#version 300 es
@@ -109,25 +138,28 @@ function program(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgr
   return p
 }
 
-export class SpiralRenderer {
+export class GraphRenderer {
   private gl: WebGL2RenderingContext
   private pointProg: WebGLProgram
   private lineProg: WebGLProgram
   private vaoPoints: WebGLVertexArrayObject
   private vaoLines: WebGLVertexArrayObject
   private vaoTrack: WebGLVertexArrayObject
-  private vaoTicks: WebGLVertexArrayObject
+  private posBuf: WebGLBuffer
+  private stateBuf: WebGLBuffer
   private edgeBuf: WebGLBuffer
+  private trackBuf: WebGLBuffer
   private trackCount = 0
-  private tickCount = 0
+  /** Edge indices currently uploaded — a subset when a neighbourhood is shown. */
+  private edgeCount = 0
 
+  readonly n: number
   positions: Float32Array
   colors: Uint8Array
   sizes: Float32Array
   edges: Uint32Array
+  states: Uint8Array
 
-  /** A uniform grid over layout space, for hit-testing without walking every
-   *  node on every mouse move. */
   private grid = new Map<string, number[]>()
   private cell = 0.05
 
@@ -136,27 +168,24 @@ export class SpiralRenderer {
     buffer: ArrayBuffer,
     offsets: LayoutOffsets,
     nodeCount: number,
-    turns: number,
   ) {
-    const gl = canvas.getContext('webgl2', {
-      antialias: true,
-      alpha: false,
-      premultipliedAlpha: false,
-    })
+    const gl = canvas.getContext('webgl2', { antialias: true, alpha: false })
     if (!gl) throw new Error('WebGL2 is not available in this browser')
     this.gl = gl
+    this.n = nodeCount
 
-    this.positions = new Float32Array(buffer, offsets.positions, nodeCount * 2)
-    this.colors = new Uint8Array(buffer, offsets.colors, nodeCount * 3)
-    this.sizes = new Float32Array(buffer, offsets.sizes, nodeCount)
-    this.edges = new Uint32Array(buffer, offsets.edges, offsets.edges_bytes / 4)
+    this.positions = new Float32Array(buffer.slice(offsets.positions, offsets.positions + offsets.positions_bytes))
+    this.colors = new Uint8Array(buffer.slice(offsets.colors, offsets.colors + offsets.colors_bytes))
+    this.sizes = new Float32Array(buffer.slice(offsets.sizes, offsets.sizes + offsets.sizes_bytes))
+    this.edges = new Uint32Array(buffer.slice(offsets.edges, offsets.edges + offsets.edges_bytes))
+    this.states = new Uint8Array(nodeCount).fill(NodeState.Normal)
 
     this.pointProg = program(gl, POINT_VS, POINT_FS)
     this.lineProg = program(gl, LINE_VS, LINE_FS)
 
-    const posBuf = gl.createBuffer()!
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, this.positions, gl.STATIC_DRAW)
+    this.posBuf = gl.createBuffer()!
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, this.positions, gl.DYNAMIC_DRAW)
 
     const colBuf = gl.createBuffer()!
     gl.bindBuffer(gl.ARRAY_BUFFER, colBuf)
@@ -166,93 +195,96 @@ export class SpiralRenderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, sizBuf)
     gl.bufferData(gl.ARRAY_BUFFER, this.sizes, gl.STATIC_DRAW)
 
-    // Points
-    this.vaoPoints = gl.createVertexArray()!
-    gl.bindVertexArray(this.vaoPoints)
-    const bind = (prog: WebGLProgram, name: string, buf: WebGLBuffer, size: number, type: number, norm: boolean) => {
+    this.stateBuf = gl.createBuffer()!
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stateBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, this.states, gl.DYNAMIC_DRAW)
+
+    const bind = (
+      prog: WebGLProgram, name: string, buf: WebGLBuffer,
+      size: number, type: number, norm: boolean,
+    ) => {
       const loc = gl.getAttribLocation(prog, name)
       if (loc < 0) return
       gl.bindBuffer(gl.ARRAY_BUFFER, buf)
       gl.enableVertexAttribArray(loc)
       gl.vertexAttribPointer(loc, size, type, norm, 0, 0)
     }
-    bind(this.pointProg, 'a_pos', posBuf, 2, gl.FLOAT, false)
+
+    this.vaoPoints = gl.createVertexArray()!
+    gl.bindVertexArray(this.vaoPoints)
+    bind(this.pointProg, 'a_pos', this.posBuf, 2, gl.FLOAT, false)
     bind(this.pointProg, 'a_color', colBuf, 3, gl.UNSIGNED_BYTE, true)
     bind(this.pointProg, 'a_size', sizBuf, 1, gl.FLOAT, false)
+    bind(this.pointProg, 'a_state', this.stateBuf, 1, gl.UNSIGNED_BYTE, false)
 
-    // Edges — drawn as indexed lines over the same position buffer, so the
-    // edge data on the wire is two integers per link and nothing more.
     this.vaoLines = gl.createVertexArray()!
     gl.bindVertexArray(this.vaoLines)
-    bind(this.lineProg, 'a_pos', posBuf, 2, gl.FLOAT, false)
+    bind(this.lineProg, 'a_pos', this.posBuf, 2, gl.FLOAT, false)
     this.edgeBuf = gl.createBuffer()!
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.edgeBuf)
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.edges, gl.STATIC_DRAW)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, this.edges, gl.DYNAMIC_DRAW)
+    this.edgeCount = this.edges.length
 
-    // The spiral track itself, as a hairline under the dots. Without it, at
-    // two turns an Archimedean spiral is indistinguishable from a blob, and
-    // the viewer has no way to know that angle means time.
-    const track: number[] = []
-    const steps = Math.max(400, turns * 400)
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps
-      const th = 2 * Math.PI * turns * t
-      const r = 0.12 + 0.86 * t
-      track.push(Math.cos(th) * r, Math.sin(th) * r)
-    }
-    this.trackCount = track.length / 2
-    const trackBuf = gl.createBuffer()!
-    gl.bindBuffer(gl.ARRAY_BUFFER, trackBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(track), gl.STATIC_DRAW)
+    this.trackBuf = gl.createBuffer()!
     this.vaoTrack = gl.createVertexArray()!
     gl.bindVertexArray(this.vaoTrack)
-    bind(this.lineProg, 'a_pos', trackBuf, 2, gl.FLOAT, false)
-
-    // Turn boundaries, as short radial ticks. The track alone says the
-    // layout is a spiral; the ticks say where one lap ends and the next
-    // begins, which is what makes "one turn is one slice of its life"
-    // something a reader can check rather than take on trust.
-    const ticks: number[] = []
-    for (let k = 0; k <= turns; k++) {
-      const t = k / turns
-      const th = 2 * Math.PI * turns * t
-      const r = 0.12 + 0.86 * t
-      // Short. Every lap of a spiral crosses angle zero, so these ticks are
-      // collinear by construction — drawn long they merge into one stray
-      // horizontal rule that reads as a rendering artifact rather than as a
-      // scale.
-      const g = (0.86 / turns) * 0.12
-      ticks.push(Math.cos(th) * (r - g), Math.sin(th) * (r - g))
-      ticks.push(Math.cos(th) * (r + g), Math.sin(th) * (r + g))
-    }
-    this.tickCount = ticks.length / 2
-    const tickBuf = gl.createBuffer()!
-    gl.bindBuffer(gl.ARRAY_BUFFER, tickBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(ticks), gl.STATIC_DRAW)
-    this.vaoTicks = gl.createVertexArray()!
-    gl.bindVertexArray(this.vaoTicks)
-    bind(this.lineProg, 'a_pos', tickBuf, 2, gl.FLOAT, false)
+    bind(this.lineProg, 'a_pos', this.trackBuf, 2, gl.FLOAT, false)
 
     gl.bindVertexArray(null)
-    this.buildGrid(nodeCount)
+    this.rebuildGrid()
   }
 
-  private key(x: number, y: number): string {
-    return `${Math.floor(x / this.cell)},${Math.floor(y / this.cell)}`
+  /** The spiral track, drawn under the dots. Without it an Archimedean
+   *  spiral at two turns is indistinguishable from a blob, and the viewer has
+   *  no way to know that angle means time. Empty in layouts where it would be
+   *  a lie. */
+  setTrack(points: Float32Array) {
+    const gl = this.gl
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.trackBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, points, gl.STATIC_DRAW)
+    this.trackCount = points.length / 2
   }
 
-  private buildGrid(n: number) {
-    for (let i = 0; i < n; i++) {
-      const k = this.key(this.positions[i * 2], this.positions[i * 2 + 1])
+  setPositions(p: Float32Array) {
+    this.positions = p
+    const gl = this.gl
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, p, gl.DYNAMIC_DRAW)
+    this.rebuildGrid()
+  }
+
+  setStates(s: Uint8Array) {
+    this.states = s
+    const gl = this.gl
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stateBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, s, gl.DYNAMIC_DRAW)
+  }
+
+  /** Draw only these edges. Used by the neighbourhood view, which shows one
+   *  node's links and would otherwise be buried under every other edge. */
+  setEdgeSubset(indices: Uint32Array) {
+    const gl = this.gl
+    gl.bindVertexArray(this.vaoLines)
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.edgeBuf)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW)
+    this.edgeCount = indices.length
+    gl.bindVertexArray(null)
+  }
+
+  private rebuildGrid() {
+    this.grid.clear()
+    for (let i = 0; i < this.n; i++) {
+      const k = `${Math.floor(this.positions[i * 2] / this.cell)},${Math.floor(this.positions[i * 2 + 1] / this.cell)}`
       const b = this.grid.get(k)
       if (b) b.push(i)
       else this.grid.set(k, [i])
     }
   }
 
-  /** Nearest node to a point in layout space, within `maxDist`. Searches the
-   *  nine cells around the query rather than all nodes, so hover cost does
-   *  not grow with the size of the soul. */
+  /** Nearest visible node, searching the nine cells around the query rather
+   *  than all nodes, so hover cost does not grow with the size of the soul.
+   *  Hidden nodes are never picked — a node you cannot see must not be a node
+   *  you can accidentally select. */
   pick(x: number, y: number, maxDist: number): number | null {
     let best: number | null = null
     let bestD = maxDist * maxDist
@@ -263,6 +295,7 @@ export class SpiralRenderer {
         const b = this.grid.get(`${gx},${gy}`)
         if (!b) continue
         for (const i of b) {
+          if (this.states[i] === NodeState.Hidden) continue
           const dx = this.positions[i * 2] - x
           const dy = this.positions[i * 2 + 1] - y
           const d = dx * dx + dy * dy
@@ -293,54 +326,50 @@ export class SpiralRenderer {
     gl.enable(gl.BLEND)
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
-    const vp: [number, number] = [gl.drawingBufferWidth, gl.drawingBufferHeight]
+    const vw = gl.drawingBufferWidth
+    const vh = gl.drawingBufferHeight
 
     const setLine = (rgba: [number, number, number, number]) => {
       gl.useProgram(this.lineProg)
       gl.uniform2f(gl.getUniformLocation(this.lineProg, 'u_offset'), view.x, view.y)
       gl.uniform1f(gl.getUniformLocation(this.lineProg, 'u_scale'), view.scale)
-      gl.uniform2f(gl.getUniformLocation(this.lineProg, 'u_viewport'), vp[0], vp[1])
+      gl.uniform2f(gl.getUniformLocation(this.lineProg, 'u_viewport'), vw, vh)
       gl.uniform4f(gl.getUniformLocation(this.lineProg, 'u_color'), ...rgba)
     }
 
-    // Track first, under everything — but legibly. At 10% it read as an
-    // artifact and the dots looked like they were floating free, which
-    // silently withdraws the one claim the view is making: that angle is
-    // time. A form that does not supply the structure a reader is reaching
-    // for is undersupplied.
-    setLine([0, 0, 0, 0.26])
-    gl.bindVertexArray(this.vaoTrack)
-    gl.drawArrays(gl.LINE_STRIP, 0, this.trackCount)
+    if (this.trackCount) {
+      setLine([0, 0, 0, 0.26])
+      gl.bindVertexArray(this.vaoTrack)
+      gl.drawArrays(gl.LINE_STRIP, 0, this.trackCount)
+    }
 
-    setLine([0, 0, 0, 0.42])
-    gl.bindVertexArray(this.vaoTicks)
-    gl.drawArrays(gl.LINES, 0, this.tickCount)
-
-    if (showEdges && this.edges.length) {
+    if (showEdges && this.edgeCount) {
       setLine([0.1, 0.1, 0.15, 0.13])
       gl.bindVertexArray(this.vaoLines)
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.edgeBuf)
-      gl.drawElements(gl.LINES, this.edges.length, gl.UNSIGNED_INT, 0)
+      gl.drawElements(gl.LINES, this.edgeCount, gl.UNSIGNED_INT, 0)
     }
 
     gl.useProgram(this.pointProg)
     gl.uniform2f(gl.getUniformLocation(this.pointProg, 'u_offset'), view.x, view.y)
     gl.uniform1f(gl.getUniformLocation(this.pointProg, 'u_scale'), view.scale)
-    gl.uniform2f(gl.getUniformLocation(this.pointProg, 'u_viewport'), vp[0], vp[1])
+    gl.uniform2f(gl.getUniformLocation(this.pointProg, 'u_viewport'), vw, vh)
     gl.uniform1f(gl.getUniformLocation(this.pointProg, 'u_dpr'), dpr)
-    gl.uniform1f(gl.getUniformLocation(this.pointProg, 'u_dim'), 1.0)
     gl.bindVertexArray(this.vaoPoints)
-    gl.drawArrays(gl.POINTS, 0, this.sizes.length)
+    gl.drawArrays(gl.POINTS, 0, this.n)
     gl.bindVertexArray(null)
   }
 
-  /** Layout-space coordinates for a pixel, so hit-testing and the pointer
-   *  agree at every zoom level. */
   toLayout(px: number, py: number, view: View): [number, number] {
     const rect = this.canvas.getBoundingClientRect()
     const aspect = rect.width / rect.height
     const ndcX = ((px - rect.left) / rect.width) * 2 - 1
     const ndcY = 1 - ((py - rect.top) / rect.height) * 2
     return [(ndcX * aspect) / view.scale - view.x, ndcY / view.scale - view.y]
+  }
+
+  /** Centre the view on a node without changing zoom. */
+  centreOn(i: number, view: View): View {
+    return { ...view, x: -this.positions[i * 2], y: -this.positions[i * 2 + 1] }
   }
 }
