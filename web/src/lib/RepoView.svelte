@@ -152,8 +152,9 @@
       <p class="lede">
         A <strong>File</strong> is words at a location at a time. A
         <strong>Thing</strong> is what persists and expresses itself through
-        one. Both are real, and they are one join apart — so most of what a
-        soul actually wrote is invisible to a query that only looks at Things.
+        one. Both are real, and they are one join apart. Which plane a soul's
+        connections live on is not a given — it is a fact about how that soul
+        was written, and it differs sharply between souls.
       </p>
 
       <div class="figures">
@@ -171,6 +172,17 @@
         </div>
       </div>
 
+      <!--
+        This sentence has to work in both directions, and the first version
+        did not. Written against W3BL0RD — 161 links in prose against 8
+        declared — it read "the gap is the finding: what the soul wrote, as
+        against what it was asked to declare", which quietly assumes prose
+        wins. lUX is the exact inverse: 3,197 in prose against 14,529
+        declared, four and a half times the other way, and the same sentence
+        turned into a claim about that soul that was simply false. A corpus of
+        one is not a corpus, and a caption fitted to it is a caption that
+        outruns its data the first time it meets a different shape.
+      -->
       <p class="finding">
         {#if planes.thingEdges === 0 && planes.fileLinks > 0}
           Every one of this soul's <strong>{planes.fileLinks}</strong> connections
@@ -180,11 +192,28 @@
           in text ({planes.literalRefs.map((r) => `${r.n} ${r.p}`).join(', ')}) —
           named, but not linked, so nothing joins up{/if}. A view that reads only
           declared references would show this soul as empty.
+        {:else if planes.fileLinks === 0 && planes.thingEdges > 0}
+          Every one of this soul's <strong>{planes.thingEdges}</strong> connections
+          is a declared reference between Things. Nothing is linked from inside a
+          document body. A view that reads only prose links would show this soul
+          as empty.
+        {:else if planes.fileLinks >= planes.thingEdges * 2}
+          <strong>{planes.fileLinks}</strong> connections are written into document
+          bodies against <strong>{planes.thingEdges}</strong> declared between
+          Things — {(planes.fileLinks / planes.thingEdges).toFixed(1)}× more. This
+          soul connects itself mostly by writing links in prose, so a query that
+          reads only declared references sees a fraction of it.
+        {:else if planes.thingEdges >= planes.fileLinks * 2}
+          <strong>{planes.thingEdges}</strong> connections are declared between
+          Things against <strong>{planes.fileLinks}</strong> written into document
+          bodies — {(planes.thingEdges / planes.fileLinks).toFixed(1)}× more. This
+          soul connects itself mostly through structured references rather than
+          through prose, so its shape is already visible to a Thing-plane query.
         {:else}
-          <strong>{planes.fileLinks}</strong> connections live in document bodies
-          against <strong>{planes.thingEdges}</strong> declared between Things.
-          The gap is the finding: it is what the soul wrote, as against what it
-          was asked to declare.
+          <strong>{planes.fileLinks}</strong> connections are written into document
+          bodies and <strong>{planes.thingEdges}</strong> are declared between
+          Things — comparable numbers, so this soul is connected about equally
+          in prose and in structure.
         {/if}
       </p>
 

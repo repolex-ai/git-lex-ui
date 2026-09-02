@@ -134,6 +134,18 @@ async fn main() {
         eprintln!("The front door still starts — you just get an empty list until this is fixed.");
     }
 
+    // Take over anything a previous run left behind, before serving. Without
+    // this, a supervisor that was killed rather than shut down starts a
+    // second server for a repo that already has one, and the first keeps its
+    // port forever.
+    {
+        let repos = state.repos.read().await.clone();
+        let n = sup.adopt_existing(&repos).await;
+        if n > 0 {
+            println!("adopted {n} server(s) left running by a previous start");
+        }
+    }
+
     let app = Router::new()
         .route("/", get(index))
         .route("/api/repos", get(api_repos))

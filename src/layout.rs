@@ -118,6 +118,17 @@ pub struct LayoutMeta {
     /// How many documents nothing could date. They sit on the rim, and they
     /// are counted here rather than being quietly placed as if they were new.
     pub undated: usize,
+    /// The commit ordinals the spiral actually spans — the birth commit of
+    /// the oldest surviving document, and of the newest.
+    ///
+    /// These are NOT the repo's first and last commit, and the difference is
+    /// not small: on lUX the oldest document still in the store was born at
+    /// ordinal 104 of 3,487, so 103 commits of history precede the centre.
+    /// The view used to caption the centre as "this soul's first commit",
+    /// which was a claim about the repository made from data about its
+    /// documents.
+    pub first_ordinal: Option<i64>,
+    pub last_ordinal: Option<i64>,
     /// Subjects typed `gl:File` in the store, before folding.
     pub file_subjects: usize,
     /// Files that carry a Thing, and so are drawn as that Thing rather than
@@ -587,6 +598,8 @@ pub fn build(
             docs: doc_meta,
             turn_dates,
             undated,
+            first_ordinal: if dated.is_empty() { None } else { Some(min_b) },
+            last_ordinal: if dated.is_empty() { None } else { Some(max_b) },
             file_subjects,
             folded_files: file_subjects.saturating_sub(file_only),
             unbridged_things,

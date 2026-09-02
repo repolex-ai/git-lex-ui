@@ -79,6 +79,10 @@ pub struct ServerStatus {
     pub www_dir: Option<String>,
     /// Millis since the epoch of the last successful identity-checked probe.
     pub last_seen_ms: Option<u128>,
+    /// True when this process was already running at startup and was taken
+    /// over rather than started. An adopted server has no stdout pipe, so its
+    /// death is noticed by the health poll rather than instantly.
+    pub adopted: bool,
     pub message: Option<String>,
 }
 
@@ -90,6 +94,9 @@ pub struct Supervisor {
     /// tabs. Built once at startup.
     child_path: Option<String>,
     port_floor: u16,
+    /// Where the pids of live children are recorded, so a supervisor that is
+    /// killed rather than shut down can find them again next time.
+    persist_path: PathBuf,
 }
 
 fn now_ms() -> u128 {
@@ -110,6 +117,7 @@ impl Supervisor {
                 .unwrap_or_default(),
             child_path: browser_suppressing_path(cache_dir),
             port_floor,
+            persist_path: cache_dir.join("children.json"),
         })
     }
 
@@ -159,6 +167,7 @@ impl Supervisor {
             pid: None,
             www_dir: None,
             last_seen_ms: None,
+            adopted: false,
             message: None,
         };
         self.servers
@@ -266,7 +275,95 @@ impl Supervisor {
             .write()
             .await
             .insert(repo.path.clone(), status.clone());
+        self.persist().await;
         status
+    }
+
+    /// Record the pids of everything currently running.
+    ///
+    /// `kill_on_drop` only fires when this process unwinds. Killed outright —
+    /// which is what a `pkill` during development does, and what a crash does
+    /// in production — the children are reparented to init and keep serving,
+    /// holding their ports, invisible to the next run. Measured during this
+    /// build: three orphaned `git-lex-serve` processes on 7900, 7920 and 7940
+    /// from earlier runs, each still answering. The pid file is what makes
+    /// them findable again.
+    async fn persist(&self) {
+        let live: Vec<serde_json::Value> = self
+            .servers
+            .read()
+            .await
+            .values()
+            .filter(|s| s.state == ServerState::Ready && s.pid.is_some())
+            .map(|s| {
+                serde_json::json!({
+                    "path": s.path,
+                    "genesis_sha": s.genesis_sha,
+                    "port": s.port,
+                    "pid": s.pid,
+                })
+            })
+            .collect();
+        if let Some(dir) = self.persist_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&live) {
+            let _ = std::fs::write(&self.persist_path, text);
+        }
+    }
+
+    /// Take over servers left running by a previous supervisor.
+    ///
+    /// Adoption is only ever on the strength of an identity check: the
+    /// recorded pid must still be alive, the port must answer, and it must
+    /// answer with the genesis sha of the repo we think it is serving. A pid
+    /// can be reused and a port can be taken by something else entirely, so
+    /// "the record says 7900 was lUX" is not evidence about what is on 7900
+    /// now — only asking is.
+    pub async fn adopt_existing(self: &Arc<Self>, repos: &[RepoProbe]) -> usize {
+        let Ok(text) = std::fs::read_to_string(&self.persist_path) else {
+            return 0;
+        };
+        let Ok(records): Result<Vec<serde_json::Value>, _> = serde_json::from_str(&text) else {
+            return 0;
+        };
+
+        let mut adopted = 0;
+        for r in records {
+            let (Some(path), Some(port), Some(pid)) = (
+                r.get("path").and_then(|v| v.as_str()),
+                r.get("port").and_then(|v| v.as_u64()),
+                r.get("pid").and_then(|v| v.as_u64()),
+            ) else {
+                continue;
+            };
+            let Some(repo) = repos.iter().find(|x| x.path == path) else {
+                continue;
+            };
+            if !pid_is_alive(pid as u32) {
+                continue;
+            }
+            if self.verify(port as u16, repo.genesis_sha.as_deref()).await.is_err() {
+                continue;
+            }
+            self.servers.write().await.insert(
+                path.to_string(),
+                ServerStatus {
+                    path: path.to_string(),
+                    genesis_sha: repo.genesis_sha.clone(),
+                    state: ServerState::Ready,
+                    port: Some(port as u16),
+                    requested_port: port as u16,
+                    pid: Some(pid as u32),
+                    www_dir: None,
+                    last_seen_ms: Some(now_ms()),
+                    adopted: true,
+                    message: Some("already running when the front door started".to_string()),
+                },
+            );
+            adopted += 1;
+        }
+        adopted
     }
 
     /// Ask the server on `port` which repo it is, and compare.
@@ -345,16 +442,31 @@ impl Supervisor {
     }
 
     pub async fn stop(&self, path: &str) -> bool {
+        // Kill by pid, not only through the Child handle: an adopted server
+        // has no handle here, and a handle-only stop silently no-ops on
+        // exactly the processes most in need of stopping.
+        let pid = self.servers.read().await.get(path).and_then(|s| s.pid);
         let child = self.children.write().await.remove(path);
-        let stopped = match child {
-            Some(mut c) => c.kill().await.is_ok(),
-            None => false,
-        };
+        let mut stopped = false;
+        if let Some(mut c) = child {
+            stopped = c.kill().await.is_ok();
+        }
+        if let Some(pid) = pid {
+            if pid_is_alive(pid) {
+                stopped |= std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            }
+        }
         if let Some(st) = self.servers.write().await.get_mut(path) {
             st.state = ServerState::Exited;
             st.port = None;
             st.message = Some("stopped".to_string());
         }
+        self.persist().await;
         stopped
     }
 
@@ -434,6 +546,16 @@ async fn read_announcement(
     });
 
     port.map(|p| (p, www))
+}
+
+/// Is this pid still a running process? `kill -0` asks without signalling.
+fn pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// `git-lex-serve viz listening on http://127.0.0.1:7901`

@@ -16,6 +16,8 @@
     docs: DocMeta[]
     turn_dates: (string | null)[]
     undated: number
+    first_ordinal: number | null
+    last_ordinal: number | null
     dropped: Dropped[]
     offsets: LayoutOffsets
   }
@@ -187,16 +189,21 @@
     </div>
 
     <div class="axis">
-      <span class="ax">centre {(meta.turn_dates[0] ?? '').slice(0, 10) || 'first commit'}</span>
+      <span class="ax">centre {(meta.turn_dates[0] ?? '').slice(0, 10) || 'oldest document'}</span>
       <span class="axline"></span>
-      <span class="ax">rim {(meta.turn_dates[meta.turn_dates.length - 1] ?? '').slice(0, 10) || 'now'}</span>
+      <span class="ax">rim {(meta.turn_dates[meta.turn_dates.length - 1] ?? '').slice(0, 10) || 'newest'}</span>
     </div>
 
     <p class="reading">
-      Angle is <strong>time</strong>: the centre is this soul's first commit,
-      the rim is its most recent, and one turn of {meta.turns} is one slice of
-      its life. Colour is class, and a dot's size is how many times that
-      document has changed.
+      Angle is <strong>time</strong>: the centre is the
+      <strong>oldest document still in the store</strong>, the rim is the
+      newest, and one turn of {meta.turns} is one slice of that span. Colour is
+      class, and a dot's size is how many times that document has changed.
+      {#if meta.first_ordinal !== null && meta.first_ordinal > 1}
+        Note that this is not the whole repository: {meta.first_ordinal - 1}
+        {meta.first_ordinal - 1 === 1 ? 'commit precedes' : 'commits precede'}
+        the centre, having left no document behind that still exists.
+      {/if}
     </p>
 
     <p class="caveat">
