@@ -62,6 +62,59 @@ pub fn q_born() -> String {
     )
 }
 
+/// Every typed subject in the now view, with a display label.
+///
+/// Includes orphans that nothing links to — a document nobody linked is
+/// still a document, and dropping it would quietly shrink the census.
+pub fn q_nodes() -> String {
+    format!(
+        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
+         SELECT ?id ?type ?label WHERE {{
+             GRAPH <{NOW}> {{
+                 ?id a ?type .
+                 OPTIONAL {{ ?id gl:name ?n }}
+                 BIND(COALESCE(?n, REPLACE(STR(?id), \"^.*/\", \"\")) AS ?label)
+             }}
+         }}"
+    )
+}
+
+/// Every link between documents.
+///
+/// Deliberately NOT the query the old viewer used. That one took `md:linksTo`
+/// and then every predicate outside the `ontology/git-lex/` namespace — which
+/// excludes `gl:relatedToId`, the predicate souls use to declare a reference
+/// from one document to another. So the declared references were never drawn
+/// at all: on lUX that is 14,529 links absent from a picture claiming to show
+/// how the soul connects.
+///
+/// This asks the question the other way round. An edge is a triple from a
+/// typed subject to an IRI that is not a class or the ontology itself, minus
+/// three pieces of machinery: `rdf:type` is membership, `gl:fileId` is the
+/// File/Thing join this layout already folds on, and `gl:id` is a node naming
+/// itself. Dangling targets are deliberately kept — resolution happens in
+/// `build`, where an unresolvable target is counted and disclosed rather than
+/// filtered out here where nobody would ever see it.
+pub fn q_edges() -> String {
+    format!(
+        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
+         SELECT DISTINCT ?from ?predicate ?target WHERE {{
+             GRAPH <{NOW}> {{
+                 ?from ?p ?to .
+                 ?from a ?tf .
+                 FILTER(isIRI(?to))
+                 FILTER(?from != ?to)
+                 FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>)
+                 FILTER(?p != gl:fileId)
+                 FILTER(?p != gl:id)
+                 FILTER(!STRSTARTS(STR(?to), \"https://repolex.ai/ontology/\"))
+                 BIND(STR(?p) AS ?predicate)
+                 BIND(STR(?to) AS ?target)
+             }}
+         }}"
+    )
+}
+
 /// Resolve every document's NAME, across both planes.
 ///
 /// This is commit 2ebd895 carried forward, and it has to live here because
@@ -112,6 +165,19 @@ pub fn q_dates() -> String {
     )
 }
 
+/// A predicate that produced at least one drawn edge.
+///
+/// Carried because edge density is dominated by a handful of predicates and
+/// the picture is unreadable without a way to switch them off: on lUX,
+/// 14,529 of 18,131 drawn links are `relatedToId` alone. A legend you cannot
+/// act on is decoration.
+#[derive(Debug, Clone, Serialize)]
+pub struct PredicateInfo {
+    pub uri: String,
+    pub name: String,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassInfo {
     pub uri: String,
@@ -136,6 +202,17 @@ pub struct Dropped {
     pub reason: String,
     pub count: usize,
     pub examples: Vec<String>,
+    /// Which predicates produced these, largest first.
+    ///
+    /// One total is nearly useless here. lUX drops 6,425 links whose target
+    /// is not a document — and 5,365 of those are a single predicate,
+    /// `copia:lookMomentId`, pointing at Moment records that were never
+    /// documents in this store. That is a systematic fact about the shape of
+    /// the data, not 6,425 pieces of rot, and the two call for completely
+    /// different reactions. Grouping is the difference between a number and
+    /// a finding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_predicate: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +224,8 @@ pub struct LayoutMeta {
     pub edge_count: usize,
     pub turns: u32,
     pub classes: Vec<ClassInfo>,
+    /// Indexed by the `edge_predicates` array in the binary payload.
+    pub predicates: Vec<PredicateInfo>,
     pub docs: Vec<DocMeta>,
     /// Ticks marking where each turn of the spiral closes, with the date the
     /// spiral had reached by then.
@@ -200,6 +279,9 @@ pub struct Offsets {
     /// u32 x2 per edge.
     pub edges: usize,
     pub edges_bytes: usize,
+    /// u16 per edge: an index into `predicates`.
+    pub edge_predicates: usize,
+    pub edge_predicates_bytes: usize,
     pub total: usize,
 }
 
@@ -552,13 +634,18 @@ pub fn build(
     let index_of: HashMap<&str, u32> =
         docs.iter().enumerate().map(|(i, d)| (d.id.as_str(), i as u32)).collect();
     let mut edge_pairs: Vec<u32> = Vec::with_capacity(edges.len() * 2);
+    let mut edge_preds: Vec<String> = Vec::with_capacity(edges.len());
     let mut missing_target: Vec<String> = Vec::new();
     let mut missing_source: Vec<String> = Vec::new();
+    let mut target_by_pred: HashMap<String, usize> = HashMap::new();
+    let mut source_by_pred: HashMap<String, usize> = HashMap::new();
     let mut self_edges = 0usize;
+    let mut dropped_targets = 0usize;
 
     for e in &edges {
         let a = fold(&e.from);
         let b = fold(&e.target);
+        let pred = e.predicate.clone().unwrap_or_else(|| "(no predicate)".to_string());
         match (index_of.get(a.as_str()), index_of.get(b.as_str())) {
             (Some(&ai), Some(&bi)) => {
                 if ai == bi {
@@ -567,37 +654,75 @@ pub fn build(
                 }
                 edge_pairs.push(ai);
                 edge_pairs.push(bi);
+                edge_preds.push(pred);
             }
             (Some(_), None) => {
+                dropped_targets += 1;
+                *target_by_pred.entry(pred).or_insert(0) += 1;
                 if missing_target.len() < 8 {
                     missing_target.push(e.target.clone());
                 }
             }
             (None, _) => {
+                *source_by_pred.entry(pred).or_insert(0) += 1;
                 if missing_source.len() < 8 {
                     missing_source.push(e.from.clone());
                 }
             }
         }
     }
-    let dropped_targets = edges.len() - edge_pairs.len() / 2 - self_edges - missing_source.len();
+
+    // Predicate table, largest first, so the legend reads as a census and
+    // the index is stable for a given soul.
+    let mut pred_counts: HashMap<&str, usize> = HashMap::new();
+    for p in &edge_preds {
+        *pred_counts.entry(p.as_str()).or_insert(0) += 1;
+    }
+    let mut pred_ranked: Vec<(&str, usize)> = pred_counts.into_iter().collect();
+    pred_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let predicates: Vec<PredicateInfo> = pred_ranked
+        .iter()
+        .map(|(uri, count)| PredicateInfo {
+            uri: uri.to_string(),
+            name: short_name(uri),
+            count: *count,
+        })
+        .collect();
+    let pred_index: HashMap<&str, u16> = predicates
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.uri.as_str(), i as u16))
+        .collect();
+    let edge_pred_idx: Vec<u16> = edge_preds
+        .iter()
+        .map(|p| pred_index.get(p.as_str()).copied().unwrap_or(0))
+        .collect();
+
+    fn rank_by_count(m: HashMap<String, usize>) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+    let missing_source_total: usize = source_by_pred.values().sum();
 
     let mut dropped = Vec::new();
-    if dropped_targets > 0 || !missing_target.is_empty() {
+    if dropped_targets > 0 {
         dropped.push(Dropped {
             // A dangling reference to a deleted document is history, not an
             // error — often the only surviving evidence the target existed.
-            reason: "the link points at a document that is not in the store — history, not an error"
+            reason: "the link points at something that is not a document in this store"
                 .to_string(),
-            count: dropped_targets.max(missing_target.len()),
+            count: dropped_targets,
             examples: missing_target,
+            by_predicate: rank_by_count(target_by_pred),
         });
     }
-    if !missing_source.is_empty() {
+    if missing_source_total > 0 {
         dropped.push(Dropped {
             reason: "the document the link is written in is not itself in the node set".to_string(),
-            count: missing_source.len(),
+            count: missing_source_total,
             examples: missing_source,
+            by_predicate: rank_by_count(source_by_pred),
         });
     }
     if self_edges > 0 {
@@ -605,6 +730,7 @@ pub fn build(
             reason: "the link points at the document it is written in".to_string(),
             count: self_edges,
             examples: vec![],
+            by_predicate: vec![],
         });
     }
 
@@ -637,12 +763,14 @@ pub fn build(
     let col_bytes = colors.len();
     let siz_bytes = sizes.len() * 4;
     let edg_bytes = edge_pairs.len() * 4;
+    let ep_bytes = edge_pred_idx.len() * 2;
 
     let pos_at = 0;
     let col_at = align4(pos_at + pos_bytes);
     let siz_at = align4(col_at + col_bytes);
     let edg_at = align4(siz_at + siz_bytes);
-    let total = edg_at + edg_bytes;
+    let ep_at = align4(edg_at + edg_bytes);
+    let total = ep_at + ep_bytes;
 
     let mut data = vec![0u8; total];
     for (i, v) in positions.iter().enumerate() {
@@ -654,6 +782,9 @@ pub fn build(
     }
     for (i, v) in edge_pairs.iter().enumerate() {
         data[edg_at + i * 4..edg_at + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in edge_pred_idx.iter().enumerate() {
+        data[ep_at + i * 2..ep_at + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
     }
 
     let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
@@ -685,6 +816,7 @@ pub fn build(
             edge_count: edge_pairs.len() / 2,
             turns,
             classes,
+            predicates,
             docs: doc_meta,
             turn_dates,
             undated,
@@ -704,6 +836,8 @@ pub fn build(
                 sizes_bytes: siz_bytes,
                 edges: edg_at,
                 edges_bytes: edg_bytes,
+                edge_predicates: ep_at,
+                edge_predicates_bytes: ep_bytes,
                 total,
             },
         },
@@ -758,6 +892,22 @@ mod tests {
         assert_eq!(l.meta.offsets.positions_bytes, l.meta.node_count * 8);
         assert_eq!(l.meta.offsets.colors_bytes, l.meta.node_count * 3);
         assert_eq!(l.meta.offsets.edges_bytes, l.meta.edge_count * 8);
+        assert_eq!(l.meta.offsets.edge_predicates_bytes, l.meta.edge_count * 2);
+        // Every drawn edge must name a predicate that exists in the table,
+        // or the legend and the picture are describing different graphs.
+        let at = l.meta.offsets.edge_predicates;
+        for i in 0..l.meta.edge_count {
+            let v = u16::from_le_bytes(l.data[at + i * 2..at + i * 2 + 2].try_into().unwrap());
+            assert!(
+                (v as usize) < l.meta.predicates.len(),
+                "edge predicate index {v} is not in the predicate table"
+            );
+        }
+        assert_eq!(
+            l.meta.predicates.iter().map(|p| p.count).sum::<usize>(),
+            l.meta.edge_count,
+            "predicate counts must account for every drawn edge"
+        );
         assert_eq!(l.data.len(), l.meta.offsets.total);
 
         // Every edge index must address a real node. An out-of-range index is

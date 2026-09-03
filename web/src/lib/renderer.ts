@@ -23,6 +23,9 @@ export interface LayoutOffsets {
   sizes_bytes: number
   edges: number
   edges_bytes: number
+  /** u16 per edge: an index into the layout's predicate table. */
+  edge_predicates: number
+  edge_predicates_bytes: number
   total: number
 }
 

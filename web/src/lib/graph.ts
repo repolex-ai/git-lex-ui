@@ -1,6 +1,7 @@
 import { NodeState, type LayoutOffsets } from './renderer'
 
 export interface ClassInfo { uri: string; name: string; count: number; color: string }
+export interface PredicateInfo { uri: string; name: string; count: number }
 export interface DocMeta {
   id: string
   label: string
@@ -8,7 +9,14 @@ export interface DocMeta {
   born: number | null
   events: number
 }
-export interface Dropped { reason: string; count: number; examples: string[] }
+export interface Dropped {
+  reason: string
+  count: number
+  examples: string[]
+  /** Which predicates produced these, largest first. One total hides the
+   *  difference between systematic shape and scattered rot. */
+  by_predicate?: [string, number][]
+}
 
 export interface LayoutMeta {
   genesis_sha: string
@@ -18,6 +26,7 @@ export interface LayoutMeta {
   edge_count: number
   turns: number
   classes: ClassInfo[]
+  predicates: PredicateInfo[]
   docs: DocMeta[]
   turn_dates: (string | null)[]
   undated: number
@@ -156,13 +165,34 @@ export function neighbourhoodPositions(
   return { positions, members }
 }
 
-/** Edge index pairs where both endpoints are in `members`. */
-export function edgesWithin(edges: Uint32Array, members: Map<number, number>): Uint32Array {
+/**
+ * The edges to draw, after filtering.
+ *
+ * Both filters live here so the count shown in the bar and the lines on the
+ * stage can never disagree — they are the same array.
+ *
+ * `members` restricts to a neighbourhood; `visiblePredicates` restricts by
+ * kind of link. The second matters more than it sounds: on lUX one predicate
+ * accounts for 14,529 of 18,131 links, so without it the picture is a single
+ * predicate's hairball with everything else buried underneath.
+ */
+export function edgesToDraw(
+  edges: Uint32Array,
+  edgePredicates: Uint16Array,
+  visiblePredicates: Set<number> | null,
+  members: Map<number, number> | null,
+  states: Uint8Array | null,
+): Uint32Array {
   const keep: number[] = []
-  for (let e = 0; e < edges.length; e += 2) {
-    if (members.has(edges[e]) && members.has(edges[e + 1])) {
-      keep.push(edges[e], edges[e + 1])
-    }
+  for (let e = 0, k = 0; e < edges.length; e += 2, k++) {
+    const a = edges[e]
+    const b = edges[e + 1]
+    if (visiblePredicates && !visiblePredicates.has(edgePredicates[k])) continue
+    if (members && (!members.has(a) || !members.has(b))) continue
+    // A link to a node that has been filtered off the stage would draw as a
+    // line into empty space.
+    if (states && (states[a] === 0 || states[b] === 0)) continue
+    keep.push(a, b)
   }
   return new Uint32Array(keep)
 }

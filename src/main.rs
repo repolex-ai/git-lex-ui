@@ -11,6 +11,7 @@
 //! never on a port number, because a port number is a place and not a name.
 
 mod layout;
+mod sparql;
 mod layout_api;
 mod registry;
 mod repo;
@@ -19,7 +20,7 @@ mod supervisor;
 use axum::{
     Router,
     extract::{Path as AxPath, State},
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -156,7 +157,7 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/layout/{genesis}", get(api_layout_meta))
         .route("/api/layout/{genesis}/data", get(api_layout_data))
-        .route("/r/{genesis}/api/{*rest}", get(proxy_get).post(proxy_post))
+        .route("/r/{genesis}/sparql", get(proxy_sparql).post(proxy_sparql))
         .route("/{*asset}", get(static_asset))
         .with_state(Arc::clone(&state));
 
@@ -181,14 +182,7 @@ async fn main() {
     println!("git-lex-ui listening on {url}");
     println!("Frontend served from {}", web_dir.display());
     println!("Registry: {}", lex_dir.join("repos.*").display());
-    // Say which guard is in force. A suppression that silently does nothing
-    // is how every click in this UI ended up also opening the old viewer.
-    match sup.guard() {
-        supervisor::BrowserGuard::None => eprintln!(
-            "WARNING: child servers will open a browser tab each — no way to suppress it on this machine"
-        ),
-        g => println!("Child browser launch suppressed by {}", g.describe()),
-    }
+    println!("Per-repo data feed: git-lex-serve sparql, from {}", args.repo_port_floor);
     if !args.no_open {
         let _ = open::that_detached(&url);
     }
@@ -397,7 +391,7 @@ async fn api_health(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "web_dir": s.web_dir.display().to_string(),
         "web_dir_present": s.web_dir.is_dir(),
         "cache_dir": s.cache_dir.display().to_string(),
-        "browser_guard": s.sup.guard().describe(),
+        "feed": "git-lex-serve sparql",
     }))
 }
 
@@ -526,31 +520,16 @@ async fn resolve_port(s: &Arc<AppState>, genesis: &str) -> Result<u16, (StatusCo
     }
 }
 
-async fn proxy_get(
+/// Pass a SPARQL query through to one repo's endpoint.
+///
+/// The browser never learns a port. It addresses a soul by its genesis sha —
+/// its permanent identity — and this resolves that to a server that is
+/// currently answering AND has been confirmed to be that repo. A port is a
+/// place; it is not a name, and on a machine running a dozen souls the
+/// difference is one soul's page showing another soul's data.
+async fn proxy_sparql(
     State(s): State<Arc<AppState>>,
-    AxPath((genesis, rest)): AxPath<(String, String)>,
-    uri: Uri,
-) -> Response {
-    let port = match resolve_port(&s, &genesis).await {
-        Ok(p) => p,
-        Err((c, m)) => return (c, m).into_response(),
-    };
-    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let url = format!("http://127.0.0.1:{port}/api/{rest}{q}");
-    match s.http.get(&url).send().await {
-        Ok(r) => relay(r).await,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            format!("the server for this repo stopped answering: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-async fn proxy_post(
-    State(s): State<Arc<AppState>>,
-    AxPath((genesis, rest)): AxPath<(String, String)>,
-    uri: Uri,
+    AxPath(genesis): AxPath<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -558,18 +537,25 @@ async fn proxy_post(
         Ok(p) => p,
         Err((c, m)) => return (c, m).into_response(),
     };
-    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let url = format!("http://127.0.0.1:{port}/api/{rest}{q}");
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
+        .unwrap_or("application/sparql-query")
         .to_string();
-    match s.http.post(&url).header("content-type", ct).body(body).send().await {
+    let url = format!("http://127.0.0.1:{port}/sparql");
+    match s
+        .http
+        .post(&url)
+        .header("content-type", ct)
+        .header("accept", "application/sparql-results+json")
+        .body(body)
+        .send()
+        .await
+    {
         Ok(r) => relay(r).await,
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            format!("the server for this repo stopped answering: {e}"),
+            format!("the data endpoint for this repo stopped answering: {e}"),
         )
             .into_response(),
     }
@@ -587,7 +573,7 @@ async fn relay(r: reqwest::Response) -> Response {
         Ok(b) => (status, [(axum::http::header::CONTENT_TYPE, ct)], b).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            format!("the reply from the repo server was cut off: {e}"),
+            format!("the reply from the repo endpoint was cut off: {e}"),
         )
             .into_response(),
     }

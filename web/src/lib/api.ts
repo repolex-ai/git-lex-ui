@@ -25,20 +25,36 @@ export const api = {
     }).then(json<{ stopped: boolean }>),
 }
 
-/** Run a SPARQL query against one repo's server, addressed by the repo's
- *  permanent identity rather than by a port. If that repo's server is not
- *  running and verified, this fails loudly — it never falls through to
- *  whatever else happens to be listening. */
+/** Run a SPARQL query against one repo's data endpoint, addressed by the
+ *  repo's permanent identity rather than by a port. If that repo's endpoint is
+ *  not running and verified, this fails loudly — it never falls through to
+ *  whatever else happens to be listening.
+ *
+ *  The endpoint speaks the W3C SPARQL protocol, so results arrive as a term
+ *  object per binding: `{"n":{"type":"literal","value":"W3BL0RD"}}`. Flattened
+ *  here to plain strings, since every caller wants the value. An unbound
+ *  variable is ABSENT from its binding rather than null, which is why callers
+ *  must treat optional columns as possibly-undefined. */
 export async function sparql<T = Record<string, string>>(
   genesis: string,
   query: string,
 ): Promise<T[]> {
-  const r = await fetch(`/r/${genesis}/api/query`, {
+  const r = await fetch(`/r/${genesis}/sparql`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ query }),
+    headers: {
+      'content-type': 'application/sparql-query',
+      accept: 'application/sparql-results+json',
+    },
+    body: query,
   })
   if (!r.ok) throw new Error((await r.text()) || `query failed: ${r.status}`)
   const body = await r.json()
-  return (body.results ?? []) as T[]
+  const bindings: Record<string, { value: string }>[] = body?.results?.bindings ?? []
+  return bindings.map((b) => {
+    const row: Record<string, string> = {}
+    for (const [k, term] of Object.entries(b)) {
+      if (term && typeof term.value === 'string') row[k] = term.value
+    }
+    return row as T
+  })
 }

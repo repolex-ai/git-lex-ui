@@ -147,6 +147,8 @@
     invalidate()
   }
 
+  const short = (u: string) => u.split(/[/#]/).pop() || u
+
   const shown = $derived(
     states ? states.reduce((a, s) => a + (s === NodeState.Hidden ? 0 : 1), 0) : 0,
   )
@@ -199,7 +201,15 @@
     <div class="disclose">
       {#if meta.undated}<span><b>{meta.undated}</b> undated, drawn on the rim</span>{/if}
       {#each meta.dropped as d}
-        <span><b>{d.count}</b> not drawn — {d.reason}</span>
+        <span>
+          <b>{d.count}</b> not drawn — {d.reason}
+          {#if d.by_predicate?.length}
+            <span class="pred">({d.by_predicate
+              .slice(0, 3)
+              .map(([p, n]) => `${n} ${short(p)}`)
+              .join(', ')}{d.by_predicate.length > 3 ? `, +${d.by_predicate.length - 3} more` : ''})</span>
+          {/if}
+        </span>
       {/each}
     </div>
   {/if}
@@ -246,6 +256,7 @@
     font-size: 10px; color: var(--ink-faint);
   }
   .disclose b { color: var(--ink-soft); }
+  .pred { color: var(--ink-faint); }
 
   .empty, .err {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;

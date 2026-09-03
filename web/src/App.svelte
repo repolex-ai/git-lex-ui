@@ -2,7 +2,7 @@
   import { api } from './lib/api'
   import type { ReposResponse, RepoProbe, ServerStatus } from './lib/types'
   import {
-    loadLayout, Adjacency, trackPoints, neighbourhoodPositions, edgesWithin,
+    loadLayout, Adjacency, trackPoints, neighbourhoodPositions, edgesToDraw,
     computeStates, type LayoutMeta,
   } from './lib/graph'
   import type { GraphRenderer } from './lib/renderer'
@@ -23,6 +23,7 @@
   let layoutErr = $state<string | null>(null)
 
   let visibleClasses = $state<Set<number>>(new Set())
+  let visiblePredicates = $state<Set<number>>(new Set())
   let search = $state('')
   let selected = $state<number | null>(null)
   let view = $state<'spiral' | 'neighbourhood'>('spiral')
@@ -82,6 +83,22 @@
         l.buffer.slice(l.meta.offsets.positions, l.meta.offsets.positions + l.meta.offsets.positions_bytes),
       )
       visibleClasses = new Set(l.meta.classes.map((_, i) => i))
+      visiblePredicates = new Set(l.meta.predicates.map((_, i) => i))
+
+      // ?links=linksTo,relatedToId restricts the drawn link kinds, so a
+      // filtered reading of a soul is a thing you can send someone rather
+      // than a set of clicks you have to describe.
+      const wantLinks = new URLSearchParams(location.search).get('links')
+      if (wantLinks) {
+        const names = new Set(wantLinks.split(',').map((x) => x.trim()).filter(Boolean))
+        const picked = l.meta.predicates
+          .map((p, i) => [p, i] as const)
+          .filter(([p]) => names.has(p.name) || names.has(p.uri))
+          .map(([, i]) => i)
+        // An unmatched name leaves the filter alone rather than blanking the
+        // stage: a typo should not look like a soul with no links.
+        if (picked.length) visiblePredicates = new Set(picked)
+      }
 
       const want = new URLSearchParams(location.search).get('doc')
       if (want) {
@@ -128,11 +145,29 @@
 
   const positions = $derived(neighbourhood ? neighbourhood.positions : spiralPositions)
   const track = $derived(view === 'spiral' && meta ? trackPoints(meta.turns) : null)
+  const allEdges = $derived(
+    buffer && meta
+      ? new Uint32Array(buffer.slice(meta.offsets.edges, meta.offsets.edges + meta.offsets.edges_bytes))
+      : null,
+  )
+  const edgePredicates = $derived(
+    buffer && meta
+      ? new Uint16Array(
+          buffer.slice(
+            meta.offsets.edge_predicates,
+            meta.offsets.edge_predicates + meta.offsets.edge_predicates_bytes,
+          ),
+        )
+      : null,
+  )
   const edgeSubset = $derived(
-    neighbourhood && adj && buffer && meta
-      ? edgesWithin(
-          new Uint32Array(buffer.slice(meta.offsets.edges, meta.offsets.edges + meta.offsets.edges_bytes)),
-          neighbourhood.members,
+    allEdges && edgePredicates && meta
+      ? edgesToDraw(
+          allEdges,
+          edgePredicates,
+          visiblePredicates.size === meta.predicates.length ? null : visiblePredicates,
+          neighbourhood ? neighbourhood.members : null,
+          computed?.states ?? null,
         )
       : null,
   )
@@ -143,8 +178,16 @@
    *  else. */
   function writeUrl(repo: RepoProbe | null, doc: number | null) {
     if (!repo?.genesis_sha) return
-    const q = doc !== null && meta ? `?doc=${encodeURIComponent(meta.docs[doc].id)}` : ''
-    history.replaceState(null, '', `${location.pathname}${q}#${repo.genesis_sha}`)
+    const q = new URLSearchParams()
+    if (doc !== null && meta) q.set('doc', meta.docs[doc].id)
+    if (meta && visiblePredicates.size < meta.predicates.length) {
+      q.set(
+        'links',
+        meta.predicates.filter((_, i) => visiblePredicates.has(i)).map((p) => p.name).join(','),
+      )
+    }
+    const qs = q.toString()
+    history.replaceState(null, '', `${location.pathname}${qs ? '?' + qs : ''}#${repo.genesis_sha}`)
   }
 
   function select(i: number | null) {
@@ -170,6 +213,21 @@
   }
   function allClasses() {
     visibleClasses = new Set((meta?.classes ?? []).map((_, i) => i))
+  }
+  function togglePredicate(i: number) {
+    const next = new Set(visiblePredicates)
+    if (next.has(i)) next.delete(i)
+    else next.add(i)
+    visiblePredicates = next
+    writeUrl(current, selected)
+  }
+  function onlyPredicate(i: number) {
+    visiblePredicates = new Set([i])
+    writeUrl(current, selected)
+  }
+  function allPredicates() {
+    visiblePredicates = new Set((meta?.predicates ?? []).map((_, i) => i))
+    writeUrl(current, selected)
   }
   function setView(v: 'spiral' | 'neighbourhood') {
     view = v
@@ -217,6 +275,10 @@
     onallclasses={allClasses}
     onsearch={(s) => (search = s)}
     onview={setView}
+    {visiblePredicates}
+    ontogglepredicate={togglePredicate}
+    onlypredicate={onlyPredicate}
+    onallpredicates={allPredicates}
   />
 
   <Stage

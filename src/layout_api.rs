@@ -17,6 +17,7 @@
 //! on the path and every `mv` silently orphans the cache.
 
 use crate::layout::{self, Layout};
+use crate::sparql::SparqlClient;
 use std::path::{Path, PathBuf};
 
 pub struct Cached {
@@ -73,51 +74,40 @@ pub async fn build_from_server(
     genesis: &str,
     head: &str,
 ) -> Result<Layout, String> {
-    let base = format!("http://127.0.0.1:{port}");
+    let c = SparqlClient::new(http.clone(), port);
 
-    async fn rows<T: serde::de::DeserializeOwned>(
-        http: &reqwest::Client,
-        url: String,
-    ) -> Result<Vec<T>, String> {
-        let r = http.get(&url).send().await.map_err(|e| format!("{url}: {e}"))?;
-        let v: serde_json::Value = r.json().await.map_err(|e| format!("{url}: {e}"))?;
-        let arr = v.get("results").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-        serde_json::from_value(arr).map_err(|e| format!("{url}: {e}"))
-    }
-
-    async fn query<T: serde::de::DeserializeOwned>(
-        http: &reqwest::Client,
-        base: &str,
-        q: String,
-    ) -> Result<Vec<T>, String> {
-        let r = http
-            .post(format!("{base}/api/query"))
-            .json(&serde_json::json!({ "query": q }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let v: serde_json::Value = r.json().await.map_err(|e| e.to_string())?;
-        let arr = v.get("results").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-        serde_json::from_value(arr).map_err(|e| e.to_string())
-    }
-
+    // Six reads, all through the one SPARQL endpoint. The old viewer's
+    // `/api/viz/nodes` and `/api/viz/edges` were only ever SPARQL wearing a
+    // REST hat; asking directly removes the dependency on that server and
+    // lets the edge query be the one this view actually needs.
+    let (qn, qe, qa, qb, qd, ql) = (
+        layout::q_nodes(),
+        layout::q_edges(),
+        layout::q_alias(),
+        layout::q_born(),
+        layout::q_dates(),
+        layout::q_labels(),
+    );
     let (nodes, edges, aliases, born, dates, labels) = tokio::join!(
-        rows::<layout::NodeRow>(http, format!("{base}/api/viz/nodes")),
-        rows::<layout::EdgeRow>(http, format!("{base}/api/viz/edges")),
-        query::<layout::AliasRow>(http, &base, layout::q_alias()),
-        query::<layout::BornRow>(http, &base, layout::q_born()),
-        query::<layout::DateRow>(http, &base, layout::q_dates()),
-        query::<layout::LabelRow>(http, &base, layout::q_labels()),
+        c.query::<layout::NodeRow>(&qn),
+        c.query::<layout::EdgeRow>(&qe),
+        c.query::<layout::AliasRow>(&qa),
+        c.query::<layout::BornRow>(&qb),
+        c.query::<layout::DateRow>(&qd),
+        c.query::<layout::LabelRow>(&ql),
     );
 
     let nodes = nodes?;
     if nodes.is_empty() {
-        return Err("this store has no documents — run `git lex sync` in the repo".to_string());
+        return Err(
+            "this store has no documents in its `now` view — run `git lex sync` in the repo"
+                .to_string(),
+        );
     }
-    // The four remaining reads are allowed to come back empty rather than
-    // fail the whole view: a soul with no edges, or one whose history graph
-    // has not been built, still has a legible spiral. What it must not do is
-    // pretend — `undated` and `dropped` in the metadata carry the shortfall.
+    // The remaining reads may legitimately come back empty: a soul with no
+    // links, or one whose history graph has not been built, still has a
+    // legible spiral. What it must not do is pretend — `undated` and
+    // `dropped` in the metadata carry the shortfall.
     Ok(layout::build(
         genesis,
         head,

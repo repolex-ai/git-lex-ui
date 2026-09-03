@@ -46,8 +46,17 @@ A soul is addressed by its genesis sha and a document by its URI, so
 
 ## How it is put together
 
-The browser only ever talks to this process. Per-repo `git-lex-serve`
-instances are children behind a proxy at `/r/<genesis-sha>/api/…`.
+The browser only ever talks to this process. Each repo gets a
+**`git-lex-serve sparql`** child — the data endpoint — behind a proxy at
+`/r/<genesis-sha>/sparql`.
+
+The endpoint choice is the architecture. The other one, `git-lex-serve viz`,
+is the old viewer's own backend: it serves that viewer's page from `.lex/www`,
+walks its own port, and opens a browser tab pointing at itself on startup with
+no flag to stop it. Feeding this interface from it meant every soul opened
+here also opened the old page. `sparql` has no interface attached — it answers
+the W3C SPARQL protocol, binds the port it is given or exits, and has a real
+`/health` and an `/info` naming the repo it serves.
 
 Repos are addressed by **genesis sha** — the hash of their first commit,
 which is also what `.lex/repo.yml` and the running server both declare as the
@@ -77,17 +86,20 @@ Measured 2026-09-01 against the live registry, not assumed:
 - That server **picks its own port**, walking up to 20 from the one it is
   given. So the port is read back off its stdout, and then the identity of
   whatever answered is verified against the expected genesis sha.
-- That server also **opens a browser tab on startup and has no flag to stop
-  it**, so every soul opened here used to also open the old viewer — which
-  reads as this UI linking back to the old one. Suppressed per platform, and
-  the guard in force is printed at startup and reported by `/api/health`,
-  because the first attempt at this (a no-op `open` first on PATH) looked
-  right and did nothing: on macOS the call is to `/usr/bin/open` by absolute
-  path, which PATH cannot shadow.
+- The `sparql` endpoint binds the port it is given **or exits** — no walking,
+  so a failure to bind is heard rather than silently served elsewhere.
 
-Nothing of the old interface is reachable through this server. The proxy
-forwards `/r/<genesis>/api/…` only; the old page, its script and its
-stylesheet all return 404.
+Nothing of the old interface is reachable through this server, and nothing
+starts it. The proxy forwards `/r/<genesis>/sparql` only.
+
+## Addressable views
+
+- `#<genesis>` — a soul
+- `?doc=<uri>#<genesis>` — one document in it, selected and centred
+- `?links=linksTo,relatedToId#<genesis>` — restricted to those link kinds
+
+A filtered reading of a soul is therefore something you can send someone,
+rather than a set of clicks you have to describe.
 
 ## What it does not do
 

@@ -20,10 +20,15 @@
     onallclasses: () => void
     onsearch: (s: string) => void
     onview: (v: 'spiral' | 'neighbourhood') => void
+    visiblePredicates: Set<number>
+    ontogglepredicate: (i: number) => void
+    onlypredicate: (i: number) => void
+    onallpredicates: () => void
   }
   let {
     repos, servers, current, busy, meta, visibleClasses, search, matchCount,
     view, hasSelection, onpick, ontoggle, onlyclass, onallclasses, onsearch, onview,
+    visiblePredicates, ontogglepredicate, onlypredicate, onallpredicates,
   }: Props = $props()
 
   function dot(r: RepoProbe): string {
@@ -120,6 +125,39 @@
       <p class="foot">no soul open</p>
     {/if}
   </section>
+
+  <!-- Link kinds. Separate from classes because they answer a different
+       question: classes are what a document IS, predicates are how documents
+       are JOINED, and on a soul where one predicate is 80% of the links the
+       picture is unreadable until you can switch it off. -->
+  <section class="block grow">
+    <h2>
+      link kinds
+      {#if meta}<span class="n">{meta.predicates.length}</span>{/if}
+      <button class="all" onclick={onallpredicates}>all</button>
+    </h2>
+    {#if meta && meta.predicates.length}
+      <ul class="classes">
+        {#each meta.predicates as p, i (p.uri)}
+          <li>
+            <button
+              class="cls"
+              class:off={!visiblePredicates.has(i)}
+              onclick={() => ontogglepredicate(i)}
+              title={p.uri}
+            >
+              <span class="tick">{visiblePredicates.has(i) ? '\u25a0' : '\u25a1'}</span>
+              <span class="cname">{p.name}</span>
+              <span class="ccount">{p.count}</span>
+            </button>
+            <button class="only" onclick={() => onlypredicate(i)} title="show only this kind">only</button>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <p class="foot">no links drawn</p>
+    {/if}
+  </section>
 </aside>
 
 <style>
@@ -202,6 +240,7 @@
   .cls.off { opacity: 0.35; }
   .cls.off .swatch { background: transparent !important; border: 1px solid var(--ink-faint); }
   .swatch { width: 9px; height: 9px; flex: none; }
+  .tick { width: 9px; flex: none; font-size: 9px; color: var(--ink-soft); }
   .cname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ccount { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
   .only {
