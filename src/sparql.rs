@@ -75,25 +75,10 @@ impl SparqlClient {
             return Err(format!("query rejected ({code}): {}", body.trim()));
         }
         let v: serde_json::Value = r.json().await.map_err(|e| format!("bad results: {e}"))?;
-        let rows = flatten(&v);
+        let rows = flatten(&v)?;
         serde_json::from_value(rows).map_err(|e| format!("unexpected result shape: {e}"))
     }
 
-    /// Same, but returning the raw flattened rows for callers that do not
-    /// have a struct for the shape.
-    pub async fn query_rows(&self, q: &str) -> Result<serde_json::Value, String> {
-        let r = self
-            .http
-            .post(format!("{}/sparql", self.base))
-            .header("content-type", "application/sparql-query")
-            .header("accept", "application/sparql-results+json")
-            .body(q.to_string())
-            .send()
-            .await
-            .map_err(|e| format!("query failed: {e}"))?;
-        let v: serde_json::Value = r.json().await.map_err(|e| format!("bad results: {e}"))?;
-        Ok(flatten(&v))
-    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -112,16 +97,37 @@ pub struct EndpointInfo {
 ///
 /// An unbound variable is simply absent from its binding, which is why every
 /// row struct treats its optional columns as `Option`.
-fn flatten(v: &serde_json::Value) -> serde_json::Value {
-    let bindings = v
+/// Flatten a W3C SPARQL results envelope into plain `{var: string}` rows.
+///
+/// Returns `Err` when the body is not a results envelope at all, and that
+/// distinction is the whole point of the function's signature.
+///
+/// It used to return an empty array for anything it did not recognise. That
+/// makes a 404 page, an error body, and a genuinely empty result set into
+/// **the same value** — and @w3bl0rd-web nearly published a finding of mine
+/// as confirmed on exactly that: they queried `/query` instead of `/sparql`,
+/// got a 404, and read the empty body as "the store does not have this",
+/// which happened to be the answer they expected. A wrong path and a true
+/// negative are byte-identical downstream unless something refuses to
+/// conflate them here.
+///
+/// An empty `bindings` array is still `Ok(vec![])`. "No rows matched" is a
+/// real answer and must not be an error.
+fn flatten(v: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let Some(bindings) = v
         .get("results")
         .and_then(|r| r.get("bindings"))
         .and_then(|b| b.as_array())
-        .cloned()
-        .unwrap_or_default();
-    serde_json::Value::Array(
+    else {
+        let head = v.to_string();
+        let head = if head.len() > 200 { format!("{}\u{2026}", &head[..200]) } else { head };
+        return Err(format!(
+            "not a SPARQL results envelope (no results.bindings) — got: {head}"
+        ));
+    };
+    Ok(serde_json::Value::Array(
         bindings
-            .into_iter()
+            .iter()
             .map(|b| {
                 let mut row = serde_json::Map::new();
                 if let Some(obj) = b.as_object() {
@@ -134,7 +140,7 @@ fn flatten(v: &serde_json::Value) -> serde_json::Value {
                 serde_json::Value::Object(row)
             })
             .collect(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -151,7 +157,7 @@ mod tests {
                ]}}"#,
         )
         .unwrap();
-        let rows = flatten(&v);
+        let rows = flatten(&v).expect("a well-formed envelope must flatten");
         assert_eq!(rows[0]["n"], "W3BL0RD");
         assert_eq!(rows[0]["o"], "https://example/x");
         // An unbound variable is absent, not null — callers must treat it as
@@ -163,6 +169,44 @@ mod tests {
     fn empty_results_are_an_empty_list_not_an_error() {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"head":{"vars":["n"]},"results":{"bindings":[]}}"#).unwrap();
-        assert_eq!(flatten(&v), serde_json::Value::Array(vec![]));
+        assert_eq!(
+            flatten(&v).expect("an empty result set is a real answer, not an error"),
+            serde_json::Value::Array(vec![])
+        );
+    }
+
+    /// The trap this signature exists to close.
+    ///
+    /// @w3bl0rd-web hit `/query` instead of `/sparql` while independently
+    /// reproducing a finding of mine, got a 404, and read the empty body as
+    /// "the store does not contain this" — which was the answer they were
+    /// expecting, so it looked like a confirmation. A wrong path and a true
+    /// negative are the same value downstream unless something refuses to
+    /// conflate them, and this is that something.
+    ///
+    /// Every case below returned `[]` before the change. Only the last one
+    /// is allowed to now.
+    #[test]
+    fn a_body_that_is_not_a_results_envelope_is_an_error_not_an_empty_answer() {
+        let not_envelopes = [
+            r#"{"error":"not found"}"#,                       // an error body
+            r#"{"head":{"vars":["n"]}}"#,                     // head, no results
+            r#"{"results":{}}"#,                              // results, no bindings
+            r#"{"results":{"bindings":{"n":"oops"}}}"#,       // bindings not a list
+            r#"{}"#,                                          // empty object
+            r#"[]"#,                                          // a bare array
+        ];
+        for body in not_envelopes {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(
+                flatten(&v).is_err(),
+                "{body} must not read as an empty result set"
+            );
+        }
+
+        // ...and the one shape that genuinely means "nothing matched".
+        let real_empty: serde_json::Value =
+            serde_json::from_str(r#"{"results":{"bindings":[]}}"#).unwrap();
+        assert!(flatten(&real_empty).is_ok());
     }
 }
