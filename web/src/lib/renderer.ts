@@ -158,6 +158,8 @@ export class GraphRenderer {
 
   readonly n: number
   positions: Float32Array
+  /** The spiral track, retained for `fitView`. Empty until `setTrack`. */
+  track: Float32Array = new Float32Array(0)
   colors: Uint8Array
   sizes: Float32Array
   edges: Uint32Array
@@ -242,6 +244,11 @@ export class GraphRenderer {
    *  no way to know that angle means time. Empty in layouts where it would be
    *  a lie. */
   setTrack(points: Float32Array) {
+    // Kept so the fit can include it. The track is drawn, so it counts as
+    // content — fitting only the nodes framed the dots correctly and let the
+    // spiral run off three edges, which reads as a broken view rather than a
+    // deliberate crop.
+    this.track = points
     const gl = this.gl
     gl.bindBuffer(gl.ARRAY_BUFFER, this.trackBuf)
     gl.bufferData(gl.ARRAY_BUFFER, points, gl.STATIC_DRAW)
@@ -369,6 +376,67 @@ export class GraphRenderer {
     const ndcX = ((px - rect.left) / rect.width) * 2 - 1
     const ndcY = 1 - ((py - rect.top) / rect.height) * 2
     return [(ndcX * aspect) / view.scale - view.x, ndcY / view.scale - view.y]
+  }
+
+  /** A view that frames the drawn content, whatever its extent.
+   *
+   *  The camera used to open at a fixed scale for every soul. That is one
+   *  zoom level shared by a 51-document soul and a 7,651-document one — the
+   *  small one opens as a dot in the middle of an empty stage, the large one
+   *  overflows, and in both cases the first thing you do is fight the view
+   *  before you can read anything. Rob called it out as the panning and
+   *  zooming not feeling right; the panning was fine, it was starting in the
+   *  wrong place.
+   *
+   *  Fits the bounding box of the actual positions, with a margin, so the
+   *  first frame is already the whole picture. `subset` lets a filtered view
+   *  frame only what it draws. */
+  fitView(aspect: number, subset?: Uint32Array | number[]): View {
+    const n = this.n
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    const visit = (i: number) => {
+      const x = this.positions[i * 2]
+      const y = this.positions[i * 2 + 1]
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return
+      if (x < minX) minX = x
+      if (x > maxX) maxX = x
+      if (y < minY) minY = y
+      if (y > maxY) maxY = y
+    }
+    if (subset && subset.length) {
+      for (const i of subset) if (i < n) visit(i)
+    } else {
+      for (let i = 0; i < n; i++) visit(i)
+      // Include the track. It is real drawn content and it reaches further
+      // than the nodes do: documents occupy only part of the commit range,
+      // but the spiral is drawn for all of it, so the outermost thing on
+      // screen is usually track rather than a node.
+      for (let i = 0; i < this.track.length; i += 2) {
+        const x = this.track[i]
+        const y = this.track[i + 1]
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+      }
+    }
+    // Nothing finite to frame — a soul with no drawable nodes. Return the
+    // old fixed view rather than a NaN camera, which renders as a blank
+    // stage indistinguishable from an empty graph.
+    if (!Number.isFinite(minX) || maxX < minX) return { scale: 0.92, x: 0, y: 0 }
+
+    const cx = (minX + maxX) / 2
+    const cy = (minY + maxY) / 2
+    // A single node, or a perfectly flat run, has zero extent in one axis.
+    // Floor the span so the scale stays finite.
+    const spanX = Math.max(maxX - minX, 1e-3)
+    const spanY = Math.max(maxY - minY, 1e-3)
+    // Clip space runs -aspect..aspect horizontally and -1..1 vertically, so
+    // the usable half-extents are `aspect` and 1. 0.88 leaves a margin, and
+    // stops nodes on the rim being clipped by their own point size.
+    const scale = Math.min((2 * aspect * 0.88) / spanX, (2 * 0.88) / spanY)
+    return { scale: Math.min(80, Math.max(0.05, scale)), x: -cx, y: -cy }
   }
 
   /** Centre the view on a node without changing zoom. */

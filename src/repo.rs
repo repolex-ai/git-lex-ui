@@ -52,6 +52,68 @@ pub enum RecencySource {
     Unknown,
 }
 
+/// What kind of git-lex repo this is.
+///
+/// **git-lex's base case is a plain repository of markdown files.** The soul
+/// kit is one thing you can install on top; it is not what git-lex is. This
+/// front door was written against a machine holding 20 souls and had quietly
+/// started treating "repo" and "soul" as the same word — Rob caught it and
+/// asked for the list to be segmented, which is right, and cheap, and stops
+/// the assumption spreading further into the UI.
+///
+/// Measured across the 24 registered repos on 2026-09-03: 20 soul, 2 squad,
+/// 1 autoknow, 1 plain (git-lex's own repo). Two independent signals — the
+/// `kit` field in `.lex/repo.yml`, and whether a `Soul/` directory or
+/// `SOUL.md` exists on disk — agreed on **all 24**, so the declared kit is
+/// trustworthy here and the filesystem check is a cross-check rather than a
+/// fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "family", rename_all = "kebab-case")]
+pub enum RepoFamily {
+    /// Runs the soul kit: journals, notes, pursuits, an identity document.
+    Soul,
+    /// Runs some other kit. Named rather than lumped, because "not a soul"
+    /// is not the same fact as "no kit" and a squad repo is neither.
+    Kitted { kit: String },
+    /// The base case: markdown in git, with git-lex tracking it. No kit.
+    Plain,
+}
+
+impl RepoFamily {
+    /// Classify from the declared kit, cross-checked against the tree.
+    ///
+    /// The kit string has two spellings in the wild — bare `soul` (6 repos)
+    /// and the full `repolex-ai/git-lex-kit-soul` (14) — so this matches on
+    /// the trailing segment rather than the whole value. A match on the
+    /// literal `"soul"` alone would have mis-filed 14 of 20 souls as some
+    /// other kit, which is precisely the kind of quiet miscount that makes a
+    /// segmented list worse than no segmentation at all.
+    fn classify(kit: Option<&str>, root: &Path) -> Self {
+        let looks_soul_on_disk = root.join("Soul").is_dir() || root.join("SOUL.md").is_file();
+        match kit {
+            None => {
+                // A tree that looks like a soul but declares no kit is still
+                // a soul to a reader; trust the evidence over the absence.
+                if looks_soul_on_disk {
+                    RepoFamily::Soul
+                } else {
+                    RepoFamily::Plain
+                }
+            }
+            Some(k) => {
+                let last = k.rsplit('-').next().unwrap_or(k);
+                if last.eq_ignore_ascii_case("soul") || looks_soul_on_disk {
+                    RepoFamily::Soul
+                } else {
+                    RepoFamily::Kitted {
+                        kit: last.to_string(),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// How far the persisted graph has fallen behind the repository.
 ///
 /// Measured 2026-09-03 across the 24 souls in the registry: **13 of the 15
@@ -101,6 +163,8 @@ pub struct RepoProbe {
     pub name_declared: bool,
     pub agent_name: Option<String>,
     pub kit: Option<String>,
+    /// Soul, some other kit, or plain markdown. The list segments on this.
+    pub family: RepoFamily,
     pub optional_kits: Vec<String>,
     pub head_sha: Option<String>,
     /// ISO-8601 of the most recent commit.
@@ -251,6 +315,7 @@ pub async fn probe(path: &Path, last_used: Option<String>) -> RepoProbe {
     };
 
     let graph = graph_freshness(path, head_sha.as_deref()).await;
+    let family = RepoFamily::classify(yml.kit.as_deref(), path);
 
     let (recency, recency_source) = match (last_used.clone(), head_time.clone()) {
         (Some(lu), _) => (Some(lu), RecencySource::LastUsed),
@@ -265,6 +330,7 @@ pub async fn probe(path: &Path, last_used: Option<String>) -> RepoProbe {
         name_declared,
         agent_name: yml.agent_name,
         kit: yml.kit,
+        family,
         optional_kits: yml.optional_kits,
         graph,
         head_sha,
@@ -359,6 +425,40 @@ mod tests {
             graph_freshness(&tmp, Some(&head)).await,
             GraphFreshness::Current { .. }
         ));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The base case must survive a machine that is 20/24 souls.
+    ///
+    /// This is the assumption Rob caught: a front door written here starts
+    /// treating "repo" and "soul" as synonyms, because on this machine they
+    /// almost are. A plain markdown repo has to classify as plain even
+    /// though nothing on this laptop looks like one except git-lex itself.
+    #[test]
+    fn plain_markdown_is_not_mistaken_for_a_soul() {
+        let tmp = std::env::temp_dir().join(format!("glui-fam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // No kit, no Soul/ — the base case.
+        assert_eq!(RepoFamily::classify(None, &tmp), RepoFamily::Plain);
+
+        // Both spellings of the soul kit found in the wild. Matching the
+        // literal "soul" alone would mis-file 14 of this machine's 20 souls.
+        for k in ["soul", "repolex-ai/git-lex-kit-soul"] {
+            assert_eq!(RepoFamily::classify(Some(k), &tmp), RepoFamily::Soul, "{k}");
+        }
+
+        // A different kit is neither a soul nor plain.
+        assert_eq!(
+            RepoFamily::classify(Some("repolex-ai/git-lex-kit-squad"), &tmp),
+            RepoFamily::Kitted { kit: "squad".into() }
+        );
+
+        // Evidence on disk outweighs a missing declaration.
+        std::fs::create_dir_all(tmp.join("Soul")).unwrap();
+        assert_eq!(RepoFamily::classify(None, &tmp), RepoFamily::Soul);
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

@@ -34,11 +34,21 @@
   let camera: View = { scale: 0.92, x: 0, y: 0 }
   let dpr = 1
   let raf = 0
+  /** Set when a new soul loads; cleared by the first frame that has both the
+   *  laid-out canvas and the track to measure. */
+  let needsFit = false
 
   function frame() {
     raf = 0
     if (!r) return
     r.resize(dpr)
+    // Fit on the first frame that can actually measure: the canvas has a
+    // laid-out size and the track has arrived. Doing it here rather than at
+    // construction is what makes the frame include the spiral.
+    if (needsFit && canvas && canvas.clientHeight > 0) {
+      camera = r.fitView(canvas.clientWidth / canvas.clientHeight)
+      needsFit = false
+    }
     r.draw(camera, dpr, showEdges)
   }
   function invalidate() {
@@ -56,7 +66,16 @@
     try {
       dpr = Math.min(window.devicePixelRatio || 1, 2)
       const next = new GraphRenderer(canvas, b, m.offsets, m.node_count)
+      // Frame the content rather than opening at a fixed zoom. One scale for
+      // every soul meant a 51-document soul opened as a dot and a 7,651-one
+      // overflowed, so the first move was always to fix the view.
+      //
+      // Deferred rather than done here: the track is uploaded by a later
+      // effect, and it reaches further than the nodes do. Fitting now frames
+      // the dots and lets the spiral run off three edges — which is exactly
+      // what it did on the first attempt.
       camera = { scale: 0.92, x: 0, y: 0 }
+      needsFit = true
       r = next
       onready(next)
       err = null
@@ -72,6 +91,7 @@
   $effect(() => {
     if (!r) return
     r.setTrack(track ?? new Float32Array(0))
+    needsFit = true
     invalidate()
   })
   $effect(() => {
@@ -143,7 +163,9 @@
     invalidate()
   }
   function reset() {
-    camera = { scale: 0.92, x: 0, y: 0 }
+    camera = r && canvas
+      ? r.fitView(canvas.clientWidth / Math.max(1, canvas.clientHeight))
+      : { scale: 0.92, x: 0, y: 0 }
     invalidate()
   }
 

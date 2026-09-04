@@ -157,6 +157,7 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/layout/{genesis}", get(api_layout_meta))
         .route("/api/layout/{genesis}/data", get(api_layout_data))
+        .route("/api/file/{genesis}", get(api_file))
         .route("/r/{genesis}/sparql", get(proxy_sparql).post(proxy_sparql))
         .route("/{*asset}", get(static_asset))
         .with_state(Arc::clone(&state));
@@ -672,5 +673,79 @@ async fn static_asset(State(s): State<Arc<AppState>>, AxPath(asset): AxPath<Stri
     match std::fs::read(&canon) {
         Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, ct)], bytes).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// The text of one document, read straight off disk.
+///
+/// Rob asked for the old viewer's behaviour: click a dot, see the actual
+/// file. That is a filesystem read, not a graph query — the store holds the
+/// document's *facts*, never its prose, so no amount of SPARQL returns the
+/// words. This front door already knows every repo's absolute path, so it can
+/// answer directly.
+///
+/// `path` is the repo-relative path carried in the File IRI
+/// (`https://repolex.ai/git-lex/File/Soul/Note/x.md` -> `Soul/Note/x.md`),
+/// which is why the client can ask for it without a second lookup.
+///
+/// **It is attacker-supplied, so it is checked rather than trusted.** The
+/// resolved path must stay inside the repo after canonicalisation, which
+/// closes `../` traversal and a symlink pointing out of the tree — the escape
+/// that a plain string check on `..` misses. This binds to localhost, but a
+/// local read-anything endpoint is worth exactly one function's care.
+#[derive(serde::Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+async fn api_file(
+    State(s): State<Arc<AppState>>,
+    AxPath(genesis): AxPath<String>,
+    axum::extract::Query(q): axum::extract::Query<FileQuery>,
+) -> Response {
+    let probe = {
+        let repos = s.repos.read().await;
+        repos
+            .iter()
+            .find(|r| r.genesis_sha.as_deref() == Some(genesis.as_str()))
+            .cloned()
+    };
+    let Some(probe) = probe else {
+        return (StatusCode::NOT_FOUND, "no such repo").into_response();
+    };
+
+    let root = std::path::Path::new(&probe.path);
+    let Ok(root) = root.canonicalize() else {
+        return (StatusCode::NOT_FOUND, "repo path is gone").into_response();
+    };
+    let Ok(full) = root.join(&q.path).canonicalize() else {
+        return (StatusCode::NOT_FOUND, "no such file").into_response();
+    };
+    if !full.starts_with(&root) {
+        return (StatusCode::FORBIDDEN, "outside the repo").into_response();
+    }
+
+    match tokio::fs::read_to_string(&full).await {
+        Ok(text) => {
+            let bytes = text.len();
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::json!({
+                    "path": q.path,
+                    "bytes": bytes,
+                    "text": text,
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+        // A file in the graph that is not on disk is not an error: the graph
+        // is a record of history and the document may have been deleted since.
+        // Say which, rather than 500-ing on a true fact about the past.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "not on disk — deleted since it was recorded").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

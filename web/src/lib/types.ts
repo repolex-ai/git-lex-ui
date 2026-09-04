@@ -31,6 +31,11 @@ export type GraphFreshness =
   | { state: 'unplaceable' }
   | { state: 'never-synced' }
 
+export type RepoFamily =
+  | { family: 'soul' }
+  | { family: 'kitted'; kit: string }
+  | { family: 'plain' }
+
 export interface RepoProbe {
   path: string
   genesis_sha: string | null
@@ -39,6 +44,10 @@ export interface RepoProbe {
   name_declared: boolean
   agent_name: string | null
   kit: string | null
+  /** Soul, another kit, or plain markdown. git-lex's base case is a repo of
+   *  markdown files with no kit at all — the list segments on this so that
+   *  case stays visible on a machine that is mostly souls. */
+  family: RepoFamily
   optional_kits: string[]
   head_sha: string | null
   head_time: string | null
@@ -90,4 +99,16 @@ export interface ServerStatus {
   www_dir: string | null
   last_seen_ms: number | null
   message: string | null
+}
+
+/** One document's text, or the reason it could not be read.
+ *
+ *  `error` non-null is not necessarily a fault: a document can be recorded in
+ *  the graph and legitimately absent from disk, because the graph records
+ *  history and history includes deletions. The panel distinguishes the two. */
+export interface FileText {
+  path: string
+  bytes: number
+  text: string | null
+  error: string | null
 }

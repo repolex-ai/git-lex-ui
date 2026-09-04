@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { LayoutMeta, DocMeta, Adjacency } from './graph'
   import { triplesFor, curie, shortUri, type Triple } from './triples'
+  import { api } from './api'
+  import type { FileText } from './types'
 
   interface Props {
     genesis: string | null
@@ -19,6 +21,21 @@
   } | null>(null)
   let loading = $state(false)
   let err = $state<string | null>(null)
+  let file = $state<FileText | null>(null)
+  let fileLoading = $state(false)
+  let showFile = $state(true)
+
+  /** The repo-relative path a File IRI carries.
+   *
+   *  `https://repolex.ai/git-lex/File/Soul/Note/x.md` -> `Soul/Note/x.md`.
+   *  Returns null for anything that is not a File IRI — a Thing has no path,
+   *  because a Thing is not a file. Collapsing those two is the mistake this
+   *  whole codebase is built to avoid, so a Thing simply has no document to
+   *  show unless it is bridged to one. */
+  const FILE_PREFIX = 'https://repolex.ai/git-lex/File/'
+  function pathOf(id: string): string | null {
+    return id.startsWith(FILE_PREFIX) ? decodeURIComponent(id.slice(FILE_PREFIX.length)) : null
+  }
 
   const doc = $derived<DocMeta | null>(
     meta && selected !== null ? (meta.docs[selected] ?? null) : null,
@@ -31,6 +48,34 @@
   const indexById = $derived(
     meta ? new Map(meta.docs.map((d, i) => [d.id, i])) : new Map<string, number>(),
   )
+
+  // Fetch the document's own text. Separate from the triples effect on
+  // purpose: they can fail independently, and a soul reading a note should
+  // still see the prose when the graph query is what broke.
+  $effect(() => {
+    const g = genesis
+    const d = doc
+    if (!g || !d) {
+      file = null
+      return
+    }
+    const rel = pathOf(d.id)
+    if (!rel) {
+      file = null
+      return
+    }
+    let cancelled = false
+    fileLoading = true
+    api.file(g, rel).then((f) => {
+      if (!cancelled) {
+        file = f
+        fileLoading = false
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  })
 
   $effect(() => {
     const g = genesis
@@ -98,6 +143,29 @@
       <p class="empty">click a node on the stage</p>
     {/if}
   </section>
+
+  {#if doc && pathOf(doc.id)}
+    <section class="block doc">
+      <h2>
+        <button class="disclose" onclick={() => (showFile = !showFile)}>
+          {showFile ? '\u25be' : '\u25b8'} document
+        </button>
+        {#if file?.text}<span class="n">{(file.bytes / 1024).toFixed(1)}k</span>{/if}
+      </h2>
+      {#if showFile}
+        {#if fileLoading}
+          <p class="empty">reading\u2026</p>
+        {:else if file?.text}
+          <pre class="filetext">{file.text}</pre>
+        {:else if file?.error}
+          <!-- Not styled as an error. A document recorded in the graph and
+               absent from disk is history doing its job, and the graph is
+               right to still hold it. -->
+          <p class="empty">{file.error}</p>
+        {/if}
+      {/if}
+    </section>
+  {/if}
 
   <section class="block links">
     <h2>links out <span class="n">{outLinks.length}</span></h2>
@@ -176,6 +244,20 @@
 </aside>
 
 <style>
+  .doc .disclose {
+    border: none; background: none; padding: 0; font: inherit; color: inherit;
+    cursor: pointer; letter-spacing: inherit; text-transform: inherit;
+  }
+  /* Reads like the file, not like the UI: monospace, wrapped, and capped so
+     a long note scrolls inside its own box rather than pushing the links and
+     triples off the bottom of the rail. */
+  .filetext {
+    margin: 0.3rem 0 0; padding: 0.4rem 0.5rem;
+    max-height: 40vh; overflow: auto;
+    background: var(--paper-tint); border: 1px solid var(--rule);
+    font-family: var(--mono); font-size: 10px; line-height: 1.5;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
   .rail {
     grid-area: right;
     border-left: 1px solid var(--rule);

@@ -86,6 +86,25 @@
     repos.reduce((a, r) => a + (r.graph?.state === 'behind' ? (r.graph.commits ?? 0) : 0), 0),
   )
 
+  /** The list, split by what kind of repo each row is.
+   *
+   *  Souls first because they are the common case here, then other kits, then
+   *  plain markdown repos. Every group is always rendered when it has rows —
+   *  a single plain repo among twenty souls is exactly the row most likely to
+   *  be forgotten, and a header is what stops it disappearing into the
+   *  majority. Empty groups draw nothing; a heading over no rows is noise. */
+  const GROUPS: { key: string; label: string; note: string }[] = [
+    { key: 'soul', label: 'souls', note: 'running the soul kit — journal, notes, pursuits' },
+    { key: 'kitted', label: 'other kits', note: 'git-lex with a kit that is not the soul kit' },
+    { key: 'plain', label: 'markdown', note: 'the base case: markdown in git, no kit installed' },
+  ]
+  let grouped = $derived(
+    GROUPS.map((g) => ({
+      ...g,
+      rows: repos.filter((r) => (r.family?.family ?? 'plain') === g.key),
+    })).filter((g) => g.rows.length > 0),
+  )
+
   function dot(r: RepoProbe): string {
     const s = servers[r.path]
     if (!s) return ''
@@ -97,9 +116,13 @@
 
 <aside class="rail">
   <section class="block">
-    <h2>souls <span class="n">{repos.length}</span></h2>
+    <h2>repos <span class="n">{repos.length}</span></h2>
     <ul class="repos">
-      {#each repos as r (r.path)}
+      {#each grouped as g (g.key)}
+        {#if grouped.length > 1}
+          <li class="grouphead" title={g.note}>{g.label} <span class="gn">{g.rows.length}</span></li>
+        {/if}
+      {#each g.rows as r (r.path)}
         <li>
           <button
             class="repo"
@@ -121,6 +144,7 @@
             </span>
           </button>
         </li>
+      {/each}
       {/each}
     </ul>
     <p class="foot">* ordered by last commit — the registry had no record of it being opened</p>
@@ -256,7 +280,17 @@
   .all:hover { background: none; color: var(--ink); }
 
   ul { list-style: none; margin: 0; padding: 0; }
-  .repos { max-height: 30vh; overflow-y: auto; }
+  .repos { max-height: 34vh; overflow-y: auto; }
+  /* Segments the list without competing with the rows. The count matters as
+     much as the name: "markdown 1" says the base case is present and rare,
+     which a bare heading would not. */
+  .grouphead {
+    font-size: 9px; letter-spacing: 0.09em; text-transform: uppercase;
+    color: var(--ink-faint); padding: 0.5rem 0.3rem 0.15rem;
+    border-bottom: 1px solid var(--rule); margin-bottom: 0.15rem;
+  }
+  .grouphead:first-child { padding-top: 0.1rem; }
+  .gn { float: right; font-variant-numeric: tabular-nums; }
 
   .repo {
     display: grid;

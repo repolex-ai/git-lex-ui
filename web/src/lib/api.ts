@@ -1,4 +1,4 @@
-import type { ReposResponse, ServerStatus } from './types'
+import type { ReposResponse, ServerStatus, FileText } from './types'
 
 async function json<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error((await r.text()) || `${r.status} ${r.statusText}`)
@@ -9,6 +9,20 @@ export const api = {
   repos: () => fetch('/api/repos').then(json<ReposResponse>),
 
   servers: () => fetch('/api/servers').then(json<ServerStatus[]>),
+
+  /** The text of one document, read off disk.
+   *
+   *  Deliberately NOT a SPARQL query. The store holds a document's facts, not
+   *  its prose — no query returns the words. Failure is returned rather than
+   *  thrown, because "recorded in the graph but no longer on disk" is a true
+   *  fact about history, not a bug, and the panel should say so rather than
+   *  showing an error box. */
+  file: async (genesis: string, path: string): Promise<FileText> => {
+    const r = await fetch(`/api/file/${genesis}?path=${encodeURIComponent(path)}`)
+    if (!r.ok) return { path, error: (await r.text()) || `${r.status}`, text: null, bytes: 0 }
+    const d = (await r.json()) as { path: string; bytes: number; text: string }
+    return { ...d, error: null }
+  },
 
   open: (path: string) =>
     fetch('/api/servers/open', {
