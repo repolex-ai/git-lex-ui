@@ -315,6 +315,32 @@ struct Counts {
 }
 
 async fn api_repos(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    // Re-read graph freshness and HEAD on every request rather than serving
+    // the boot-time snapshot.
+    //
+    // This is not a nicety. The freshness marker exists to catch a graph that
+    // has drifted behind its repo, and a marker computed once at startup
+    // drifts in exactly the same way — it would sit there reading "current"
+    // while the repo moved underneath it, which is the defect wearing the
+    // costume of its own detector. Caught within ten minutes of shipping it,
+    // by saving a file and watching the row not change.
+    //
+    // The cost is one `ls` plus one or two `git` calls per repo, run
+    // concurrently. Everything expensive (layouts, the store) stays cached
+    // and keyed by HEAD; this refreshes only the cheap facts that go stale.
+    {
+        let snapshot = s.repos.read().await.clone();
+        let refreshed = futures_util::future::join_all(snapshot.into_iter().map(|r| async move {
+            let last_used = if r.recency_source == repo::RecencySource::LastUsed {
+                r.recency.clone()
+            } else {
+                None
+            };
+            repo::probe(std::path::Path::new(&r.path), last_used).await
+        }))
+        .await;
+        *s.repos.write().await = refreshed;
+    }
     let repos = s.repos.read().await.clone();
     let dropped = s.dropped.read().await.clone();
     let count_of = |v: registry::Verdict| dropped.iter().filter(|d| d.verdict == v).count();
