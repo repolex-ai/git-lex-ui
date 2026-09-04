@@ -73,6 +73,7 @@ pub async fn build_from_server(
     port: u16,
     genesis: &str,
     head: &str,
+    repo_path: &std::path::Path,
 ) -> Result<Layout, String> {
     let c = SparqlClient::new(http.clone(), port);
 
@@ -80,6 +81,33 @@ pub async fn build_from_server(
     // `/api/viz/nodes` and `/api/viz/edges` were only ever SPARQL wearing a
     // REST hat; asking directly removes the dependency on that server and
     // lets the edge query be the one this view actually needs.
+    let qs = layout::q_store_head();
+    let store_head = c
+        .query::<layout::StoreHeadRow>(&qs)
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|r| r.id);
+
+    // How far behind, counted by git rather than guessed. Reported as
+    // unknown when it cannot be determined — zero is the reassuring answer
+    // and must never be the fallback.
+    let commits_behind = match &store_head {
+        Some(sh) if sh != head => tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("rev-list")
+            .arg("--count")
+            .arg(format!("{sh}..{head}"))
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()),
+        Some(_) => Some(0),
+        None => None,
+    };
+
     let (qn, qe, qa, qb, qd, ql) = (
         layout::q_nodes(),
         layout::q_edges(),
@@ -117,5 +145,7 @@ pub async fn build_from_server(
         born.unwrap_or_default(),
         dates.unwrap_or_default(),
         labels.unwrap_or_default(),
+        store_head,
+        commits_behind,
     ))
 }

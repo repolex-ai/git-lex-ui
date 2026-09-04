@@ -407,14 +407,31 @@ async fn layout_target(
         StatusCode::NOT_FOUND,
         format!("no repo on this machine has genesis {genesis}"),
     ))?;
-    let probe = s
-        .repos
-        .read()
-        .await
-        .iter()
-        .find(|r| r.path == path)
-        .cloned()
-        .ok_or((StatusCode::NOT_FOUND, "repo vanished from the list".to_string()))?;
+    // Re-probe rather than trusting the startup snapshot.
+    //
+    // The layout cache is keyed on HEAD, which is only an invalidation if the
+    // HEAD is current. Read once at startup it is a photograph: a repo that
+    // gains commits while this is running keeps serving the graph it had when
+    // the front door opened, labelled "from cache" and looking correct. Caught
+    // by committing four documents to my own soul and watching the view not
+    // change — the exact defect the cache's own comment warns about, in the
+    // code that carries the comment.
+    //
+    // A probe is two cheap local git calls, and it happens once per layout
+    // request, not per frame.
+    let known = s.repos.read().await.iter().find(|r| r.path == path).cloned();
+    let last_used = known.as_ref().and_then(|r| {
+        if r.recency_source == repo::RecencySource::LastUsed { r.recency.clone() } else { None }
+    });
+    let probe = repo::probe(std::path::Path::new(&path), last_used).await;
+    // Keep the shown list in step, so the picker's commit count and last
+    // activity do not drift away from what the stage is drawing.
+    {
+        let mut repos = s.repos.write().await;
+        if let Some(slot) = repos.iter_mut().find(|r| r.path == path) {
+            *slot = probe.clone();
+        }
+    }
     let port = s.sup.proxy_port(&path).await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -451,7 +468,15 @@ async fn api_layout_meta(
             .into_response();
     }
 
-    let built = match layout_api::build_from_server(&s.http, port, &genesis, &head).await {
+    let built = match layout_api::build_from_server(
+        &s.http,
+        port,
+        &genesis,
+        &head,
+        std::path::Path::new(&probe.path),
+    )
+    .await
+    {
         Ok(l) => l,
         Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
     };

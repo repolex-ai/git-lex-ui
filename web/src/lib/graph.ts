@@ -21,6 +21,8 @@ export interface Dropped {
 export interface LayoutMeta {
   genesis_sha: string
   head_sha: string
+  store_head: string | null
+  commits_behind: number | null
   built_at_ms: number
   node_count: number
   edge_count: number
@@ -68,11 +70,34 @@ export class Adjacency {
       this.out.push([])
       this.inc.push([])
     }
+    // Neighbours are UNIQUE, and that is load-bearing rather than tidy.
+    //
+    // Two documents can be joined by more than one edge — the same target
+    // reached through `relatedToId` in the frontmatter AND through a body
+    // link in the prose, which is the normal case for a document that
+    // declares a reference and then also writes about it. Left as duplicates,
+    // a keyed `{#each}` over a neighbour list throws `each_key_duplicate`,
+    // which ABORTS the update: the panel renders half-built, showing "7 out"
+    // in its header and "0" in the section below it, and the canvas never
+    // draws at all. One exception, three symptoms, none of them looking like
+    // a duplicate key.
+    //
+    // A neighbour is a document you can travel to. How many edges lead there
+    // is a fact about the edges, and it is counted where edges are counted.
+    const seenOut = new Set<number>()
+    const seenInc = new Set<number>()
     for (let e = 0; e < edges.length; e += 2) {
       const a = edges[e]
       const b = edges[e + 1]
-      if (a < n && b < n) {
+      if (a >= n || b >= n) continue
+      const ko = a * n + b
+      if (!seenOut.has(ko)) {
+        seenOut.add(ko)
         this.out[a].push(b)
+      }
+      const ki = b * n + a
+      if (!seenInc.has(ki)) {
+        seenInc.add(ki)
         this.inc[b].push(a)
       }
     }

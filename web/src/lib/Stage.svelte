@@ -173,6 +173,26 @@
     <button onclick={reset}>reset view</button>
   </div>
 
+  <!-- The store is built by `git lex sync`, not by `git lex save`. A soul can
+       be several documents ahead of the graph drawn from it, and every number
+       on screen will be internally consistent and wrong about today. That is
+       the one thing this view must never let pass quietly, so it sits above
+       the graph rather than in a footer. -->
+  {#if meta && meta.store_head && meta.store_head !== meta.head_sha}
+    <div class="stale">
+      <b>This graph is behind the repo.</b>
+      The store was last built from commit <code>{meta.store_head.slice(0, 8)}</code>;
+      the repo is at <code>{meta.head_sha.slice(0, 8)}</code>
+      {#if meta.commits_behind !== null}
+        — <b>{meta.commits_behind}</b>
+        {meta.commits_behind === 1 ? 'commit' : 'commits'} not in this picture.
+      {:else}
+        — by an unknown number of commits.
+      {/if}
+      Run <code>git lex sync</code> in the repo, then reload.
+    </div>
+  {/if}
+
   <div class="canvas-wrap">
     {#if err}
       <p class="err">{err}</p>
@@ -236,6 +256,17 @@
   .axis { color: var(--ink-faint); }
   .bar label { display: flex; align-items: center; gap: 0.25rem; }
   .bar button { font-size: 11px; padding: 0.1rem 0.45rem; }
+
+  .stale {
+    flex: none;
+    background: #fff8e6;
+    border-bottom: 1px solid #e8d9a8;
+    color: var(--warn);
+    padding: 0.35rem 0.7rem;
+    font-size: 11px;
+  }
+  .stale b { color: var(--ink); }
+  .stale code { font-size: 10px; }
 
   .canvas-wrap { position: relative; flex: 1; min-height: 0; }
   canvas { width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; }

@@ -20,7 +20,7 @@
 //! by it alone would tie 92% of rows while looking deliberate.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// One row as it appears on disk. `last_used` is `Option` because it is null
@@ -165,11 +165,23 @@ pub fn serialize(file: &RegistryFile, fmt: Format) -> Result<String, String> {
     }
 }
 
-/// Classify every entry. Pure — does no writing and no network.
+/// Classify every entry, at most once per path.
+///
+/// Nothing stops the registry holding the same path twice — it is appended to
+/// by every git-lex run on the machine, concurrently. A repeated path would
+/// reach the UI as two rows with the same identity, and a keyed list over
+/// them throws rather than rendering, which aborts the update and leaves the
+/// page half-built. That failure has already been paid for once here, in the
+/// neighbour lists; this is the same shape one layer up, closed cheaply.
+///
+/// The FIRST occurrence wins, so the earlier `last_used` is not silently
+/// replaced by a later null.
 pub fn classify(entries: &[RegistryEntry], home: &Path) -> Vec<Classified> {
     let roots = ephemeral_roots(home);
+    let mut seen: HashSet<&str> = HashSet::new();
     entries
         .iter()
+        .filter(|e| seen.insert(e.path.as_str()))
         .map(|e| {
             let p = Path::new(&e.path);
             let (verdict, reason) = if !p.is_dir() {

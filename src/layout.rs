@@ -62,6 +62,29 @@ pub fn q_born() -> String {
     )
 }
 
+/// The newest commit the STORE knows about.
+///
+/// This is not the repo's HEAD, and the gap between them is the single most
+/// important thing this view can tell you. `git lex save` commits and
+/// reconciles sidecars; it does NOT rebuild the store's `now` view. That
+/// happens on `git lex sync`. So a soul can be four documents ahead of the
+/// graph drawn from it, and every number on screen will be internally
+/// consistent, correct as of some past moment, and wrong about today.
+///
+/// Found by committing four documents to my own soul and watching the picture
+/// not change. A fresh endpoint saw the same 23 journals as the running one,
+/// which is how I knew it was the store and not a server holding a snapshot.
+/// It is also why lUX drew nothing for a day: its `now` view held zero
+/// triples and nothing said so.
+pub fn q_store_head() -> String {
+    format!(
+        "PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
+         SELECT ?id ?ord WHERE {{
+             GRAPH <{COMMITS}> {{ ?c g2:ordinalDerived ?ord ; g2:id ?id }}
+         }} ORDER BY DESC(xsd:integer(?ord)) LIMIT 1"
+    )
+}
+
 /// Every typed subject in the now view, with a display label.
 ///
 /// Includes orphans that nothing links to — a document nobody linked is
@@ -218,7 +241,15 @@ pub struct Dropped {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayoutMeta {
     pub genesis_sha: String,
+    /// The repo's HEAD, read from git at request time.
     pub head_sha: String,
+    /// The newest commit the store was synced from. When this differs from
+    /// `head_sha` the picture is behind the repo and says so.
+    pub store_head: Option<String>,
+    /// How many commits the store is behind. `None` when it could not be
+    /// determined — reported as unknown rather than as zero, since zero is
+    /// the reassuring answer and must never be the guess.
+    pub commits_behind: Option<usize>,
     pub built_at_ms: u128,
     pub node_count: usize,
     pub edge_count: usize,
@@ -329,6 +360,12 @@ pub struct LabelRow {
 }
 
 #[derive(serde::Deserialize)]
+pub struct StoreHeadRow {
+    pub id: String,
+    pub ord: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct DateRow {
     pub ord: String,
     pub when: String,
@@ -382,6 +419,8 @@ pub fn build(
     born_rows: Vec<BornRow>,
     date_rows: Vec<DateRow>,
     label_rows: Vec<LabelRow>,
+    store_head: Option<String>,
+    commits_behind: Option<usize>,
 ) -> Layout {
     // Best title per subject: lowest rank wins, so a declared Thing-plane
     // name beats a file-plane one.
@@ -808,6 +847,8 @@ pub fn build(
         meta: LayoutMeta {
             genesis_sha: genesis_sha.to_string(),
             head_sha: head_sha.to_string(),
+            store_head,
+            commits_behind,
             built_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -879,7 +920,7 @@ mod tests {
         let node_rows = nodes.len();
 
         let t0 = std::time::Instant::now();
-        let l = build("genesis", "head", nodes, edges, aliases, born, dates, labels);
+        let l = build("genesis", "head", nodes, edges, aliases, born, dates, labels, None, None);
         let elapsed = t0.elapsed();
 
         eprintln!(
@@ -930,6 +971,8 @@ mod tests {
             rows(&dir, "lux_born.json"),
             rows(&dir, "lux_dates.json"),
             Vec::new(),
+            None,
+            None,
         );
         assert_eq!(l.data, l2.data, "layout is not deterministic");
     }
@@ -963,7 +1006,7 @@ mod tests {
             born.push(BornRow { s: id, born: o.into(), events: "1".into() });
         }
 
-        let l = build("g", "h", nodes, vec![], vec![], born, vec![], vec![]);
+        let l = build("g", "h", nodes, vec![], vec![], born, vec![], vec![], None, None);
         let turns = l.meta.turns as f32;
 
         // Recover each cohort member's angle and radius.
