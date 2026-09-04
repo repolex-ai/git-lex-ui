@@ -1,6 +1,8 @@
 <script lang="ts">
   import { GraphRenderer, NodeState, type View } from './renderer'
   import type { LayoutMeta, DocMeta } from './graph'
+  import DocPanel from './DocPanel.svelte'
+  import type { FileText } from './types'
 
   interface Props {
     meta: LayoutMeta | null
@@ -14,10 +16,19 @@
     centreOn: number | null
     onselect: (i: number | null) => void
     onready: (r: GraphRenderer) => void
+    /** The document panel floats over the canvas, so it is rendered here
+     *  rather than by the app shell — `.canvas-wrap` is the positioned
+     *  ancestor it anchors to, and a sibling of the stage would have become
+     *  a fourth column in the app's three-column grid. */
+    docOpen: boolean
+    docFile: FileText | null
+    docLoading: boolean
+    ondocclose: () => void
   }
   let {
     meta, buffer, states, track, positions, edgeSubset,
     selected, view, centreOn, onselect, onready,
+    docOpen, docFile, docLoading, ondocclose,
   }: Props = $props()
 
   let canvas = $state<HTMLCanvasElement | null>(null)
@@ -37,6 +48,12 @@
   /** Set when a new soul loads; cleared by the first frame that has both the
    *  laid-out canvas and the track to measure. */
   let needsFit = false
+
+  /** How close a pointer must be to a node, in layout units before scale.
+   *  Deliberately larger than a dot: the dots are half the size they were,
+   *  and a target you have to hit exactly is a worse target than a small
+   *  one you can hit approximately. */
+  const PICK_RADIUS = 0.028
 
   function frame() {
     raf = 0
@@ -107,7 +124,13 @@
   })
 
   $effect(() => {
-    const onResize = () => invalidate()
+    // Refit, not just redraw. With the view locked this is the only thing
+    // keeping the graph framed — nobody can pan it back after a resize
+    // changes the aspect ratio.
+    const onResize = () => {
+      needsFit = true
+      invalidate()
+    }
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
@@ -115,58 +138,29 @@
     }
   })
 
-  let drag: { px: number; py: number; ox: number; oy: number; moved: boolean } | null = null
+  // The view is LOCKED: no pan, no zoom.
+  //
+  // The layout already fits the window, and at that scale the whole soul is
+  // legible without moving anything — so pan and zoom were two ways to leave
+  // a good view and no way to get back to it except a button. Rob: "I don't
+  // really need to zoom." Removing them also removes every bug they carried:
+  // the drag-that-is-really-a-click, the pick radius that had to be divided
+  // by the current scale, and a camera that could be left somewhere the
+  // reset button was the only escape from.
+  //
+  // What stays is selection and hover, which is what the stage is actually
+  // for. `camera` is now written in exactly one place: the fit.
 
-  function onDown(e: PointerEvent) {
-    canvas?.setPointerCapture(e.pointerId)
-    drag = { px: e.clientX, py: e.clientY, ox: camera.x, oy: camera.y, moved: false }
-  }
   function onUp(e: PointerEvent) {
-    canvas?.releasePointerCapture(e.pointerId)
-    // A click is a drag that never moved. Without this, every pan that ends
-    // over a node also selects it.
-    if (drag && !drag.moved && r) {
-      const [lx, ly] = r.toLayout(e.clientX, e.clientY, camera)
-      onselect(r.pick(lx, ly, 0.02 / camera.scale))
-    }
-    drag = null
+    if (!r) return
+    const [lx, ly] = r.toLayout(e.clientX, e.clientY, camera)
+    onselect(r.pick(lx, ly, PICK_RADIUS / camera.scale))
   }
   function onMove(e: PointerEvent) {
-    if (!r || !canvas) return
-    if (drag) {
-      const rect = canvas.getBoundingClientRect()
-      const aspect = rect.width / rect.height
-      if (Math.abs(e.clientX - drag.px) + Math.abs(e.clientY - drag.py) > 3) drag.moved = true
-      camera = {
-        ...camera,
-        x: drag.ox + ((e.clientX - drag.px) / rect.width) * 2 * aspect / camera.scale,
-        y: drag.oy - ((e.clientY - drag.py) / rect.height) * 2 / camera.scale,
-      }
-      hover = null
-      invalidate()
-      return
-    }
+    if (!r || !meta) return
     const [lx, ly] = r.toLayout(e.clientX, e.clientY, camera)
-    const i = r.pick(lx, ly, 0.02 / camera.scale)
-    hover = i !== null && meta ? { doc: meta.docs[i], x: e.clientX, y: e.clientY } : null
-  }
-  function onWheel(e: WheelEvent) {
-    if (!r || !canvas) return
-    e.preventDefault()
-    const [bx, by] = r.toLayout(e.clientX, e.clientY, camera)
-    const next = Math.min(80, Math.max(0.25, camera.scale * Math.exp(-e.deltaY * 0.0016)))
-    const rect = canvas.getBoundingClientRect()
-    const aspect = rect.width / rect.height
-    const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1
-    const ndcY = 1 - ((e.clientY - rect.top) / rect.height) * 2
-    camera = { scale: next, x: (ndcX * aspect) / next - bx, y: ndcY / next - by }
-    invalidate()
-  }
-  function reset() {
-    camera = r && canvas
-      ? r.fitView(canvas.clientWidth / Math.max(1, canvas.clientHeight))
-      : { scale: 0.92, x: 0, y: 0 }
-    invalidate()
+    const i = r.pick(lx, ly, PICK_RADIUS / camera.scale)
+    hover = i !== null ? { doc: meta.docs[i], x: e.clientX, y: e.clientY } : null
   }
 
   const short = (u: string) => u.split(/[/#]/).pop() || u
@@ -192,7 +186,6 @@
     {/if}
     <span class="spacer"></span>
     <label><input type="checkbox" bind:checked={showEdges} onchange={invalidate} /> edges</label>
-    <button onclick={reset}>reset view</button>
   </div>
 
   <!-- The store is built by `git lex sync`, not by `git lex save`. A soul can
@@ -224,12 +217,19 @@
     <canvas
       bind:this={canvas}
       class:hidden={!meta}
-      onpointerdown={onDown}
       onpointerup={onUp}
       onpointermove={onMove}
       onpointerleave={() => (hover = null)}
-      onwheel={onWheel}
     ></canvas>
+
+    {#if docOpen && meta && selected !== null}
+      <DocPanel
+        title={meta.docs[selected].label}
+        file={docFile}
+        loading={docLoading}
+        onclose={ondocclose}
+      />
+    {/if}
 
     {#if hover && meta}
       <div class="tip" style="left:{hover.x + 14}px; top:{hover.y + 14}px">

@@ -9,6 +9,7 @@
   import LeftRail from './lib/LeftRail.svelte'
   import Stage from './lib/Stage.svelte'
   import Inspector from './lib/Inspector.svelte'
+  import type { FileText } from './lib/types'
 
   let data = $state<ReposResponse | null>(null)
   let servers = $state<Record<string, ServerStatus>>({})
@@ -26,6 +27,49 @@
   let visiblePredicates = $state<Set<number>>(new Set())
   let search = $state('')
   let selected = $state<number | null>(null)
+
+  // --- the document panel -------------------------------------------------
+  //
+  // Floats over the stage rather than living in the inspector: Rob asked for
+  // the old viewer's behaviour, where a document is something you open on top
+  // of the graph and dismiss, not a section competing with the triples for
+  // room in a 18rem rail.
+  let docFile = $state<FileText | null>(null)
+  let docLoading = $state(false)
+  let docOpen = $state(false)
+
+  /** The repo-relative path a File IRI carries.
+   *
+   *  `https://repolex.ai/git-lex/File/Soul/Note/x.md` -> `Soul/Note/x.md`.
+   *  Null for anything that is not a File IRI — a Thing has no path, because
+   *  a Thing is not a file. */
+  const FILE_PREFIX = 'https://repolex.ai/git-lex/File/'
+  function pathOf(id: string): string | null {
+    return id.startsWith(FILE_PREFIX) ? decodeURIComponent(id.slice(FILE_PREFIX.length)) : null
+  }
+
+  $effect(() => {
+    const g = current?.genesis_sha ?? null
+    const d = meta && selected !== null ? meta.docs[selected] : null
+    const rel = d ? pathOf(d.id) : null
+    if (!g || !rel) {
+      docFile = null
+      docOpen = false
+      return
+    }
+    let cancelled = false
+    docLoading = true
+    docOpen = true
+    api.file(g, rel).then((f) => {
+      if (!cancelled) {
+        docFile = f
+        docLoading = false
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  })
   let view = $state<'spiral' | 'neighbourhood'>('spiral')
   let centreOn = $state<number | null>(null)
   let hops = 2
@@ -293,6 +337,10 @@
     {centreOn}
     onselect={select}
     onready={onReady}
+    {docOpen}
+    {docFile}
+    {docLoading}
+    ondocclose={() => (docOpen = false)}
   />
 
   <Inspector

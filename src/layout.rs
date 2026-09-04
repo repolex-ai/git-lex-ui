@@ -666,7 +666,11 @@ pub fn build(
 
         // Size is how many times the document changed, compressed so a
         // 300-event document does not swallow its neighbours.
-        sizes[i] = 3.2 * (1.0 + (d.events as f32 + 1.0).log2() * 0.28);
+        // Halved from 3.2 on 2026-09-04 — Rob asked for smaller dots, and at
+        // a view that now fits the window they were reading as blobs rather
+        // than as points on a track. See LAYOUT_VERSION in layout_api.rs:
+        // the cache is keyed by HEAD, which cannot see a change to this line.
+        sizes[i] = 1.6 * (1.0 + (d.events as f32 + 1.0).log2() * 0.28);
     }
 
     // --- edges ------------------------------------------------------------

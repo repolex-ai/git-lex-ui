@@ -20,6 +20,17 @@ use crate::layout::{self, Layout};
 use crate::sparql::SparqlClient;
 use std::path::{Path, PathBuf};
 
+/// Bumped whenever the *shape or values* of a computed layout change, not
+/// just its inputs.
+///
+/// The cache is keyed by HEAD, which correctly invalidates when the repo
+/// moves — but a change to the layout code itself moves nothing, so every
+/// already-cached soul would keep serving the old geometry with no way to
+/// tell. Halving the node sizes was exactly that: a change no key could see.
+/// A cache that cannot notice its own producer changed is the same defect as
+/// a figure that was correct when computed and wrong when read.
+const LAYOUT_VERSION: u32 = 2;
+
 pub struct Cached {
     pub meta_json: String,
     pub data: Vec<u8>,
@@ -33,8 +44,8 @@ fn dir_for(cache_root: &Path, genesis: &str) -> PathBuf {
 fn paths(cache_root: &Path, genesis: &str, head: &str) -> (PathBuf, PathBuf) {
     let d = dir_for(cache_root, genesis);
     (
-        d.join(format!("layout-{head}.json")),
-        d.join(format!("layout-{head}.bin")),
+        d.join(format!("layout-v{LAYOUT_VERSION}-{head}.json")),
+        d.join(format!("layout-v{LAYOUT_VERSION}-{head}.bin")),
     )
 }
 
