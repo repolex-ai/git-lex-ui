@@ -52,6 +52,44 @@ pub enum RecencySource {
     Unknown,
 }
 
+/// How far the persisted graph has fallen behind the repository.
+///
+/// Measured 2026-09-03 across the 24 souls in the registry: **13 of the 15
+/// that have ever been synced were behind**, by 74 commits in total, worst
+/// case lUX at 27. So this is the normal state of a soul, not an alarm — and
+/// nothing anywhere said so, because `git lex save` advances the repo and
+/// only `git lex sync` advances the graph.
+///
+/// The probe is an `ls`. `git lex sync` writes
+/// `.lex/_ignore/spine/<sha>.spine.tsv`, **named for the commit it was built
+/// at**, so the graph's position is readable from a filename without opening
+/// the store, starting a server, or perturbing anything. Credit to
+/// @w3bl0rd-web, who found it while reproducing the staleness bug.
+///
+/// The variants are deliberately not collapsible to a boolean: 3 souls have
+/// an oxigraph store but no spine file at all, and 6 have neither. "I cannot
+/// tell" must never render as "current" — zero is the reassuring answer and
+/// it is exactly the fallback that produced four separate wrong captions on
+/// 2026-08-27.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum GraphFreshness {
+    /// The spine's sha is HEAD. The graph describes today.
+    Current { sha: String },
+    /// The spine names an ancestor of HEAD. `commits` is `None` when the
+    /// count could not be taken (a spine naming a sha this repo does not
+    /// contain — a rewritten history, or a spine copied in from elsewhere).
+    Behind {
+        sha: String,
+        commits: Option<u64>,
+    },
+    /// A store exists but no spine names its position. Cannot be placed from
+    /// the filesystem alone; ask the running server for its newest commit.
+    Unplaceable,
+    /// No store at all. This repo has never been synced.
+    NeverSynced,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoProbe {
     pub path: String,
@@ -71,6 +109,9 @@ pub struct RepoProbe {
     /// The timestamp this row should sort by, and where it came from.
     pub recency: Option<String>,
     pub recency_source: RecencySource,
+    /// How far the persisted graph trails the repo. Read from the spine
+    /// filename; never inferred, never defaulted to "fine".
+    pub graph: GraphFreshness,
     /// Whether `.lex/www/` exists — the directory the per-repo server reads
     /// its frontend from on every request.
     pub has_www: bool,
@@ -98,6 +139,61 @@ async fn git(path: &Path, args: &[&str]) -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Read the graph's position from the spine filename, and how far HEAD has
+/// run ahead of it.
+///
+/// Deliberately does not open the store. The whole value of this probe is
+/// that it costs one directory listing per repo and is safe to run against
+/// every soul on the machine at paint time, including ones nothing is
+/// serving.
+async fn graph_freshness(path: &Path, head: Option<&str>) -> GraphFreshness {
+    let spine_dir = path.join(".lex/_ignore/spine");
+    let store = path.join(".lex/_ignore/oxigraph");
+
+    // Collect the shas the spine directory names. Normally exactly one; take
+    // the newest by mtime if a repo has accumulated several, since the spine
+    // is a position marker and the latest one is the position.
+    let mut spines: Vec<(std::time::SystemTime, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&spine_dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(sha) = name.strip_suffix(".spine.tsv") else {
+                continue;
+            };
+            if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            spines.push((t, sha.to_string()));
+        }
+    }
+    spines.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let Some((_, sha)) = spines.into_iter().next() else {
+        return if store.is_dir() {
+            GraphFreshness::Unplaceable
+        } else {
+            GraphFreshness::NeverSynced
+        };
+    };
+
+    match head {
+        Some(h) if h == sha => GraphFreshness::Current { sha },
+        Some(h) => {
+            let commits = git(path, &["rev-list", "--count", &format!("{sha}..{h}")])
+                .await
+                .and_then(|c| c.parse::<u64>().ok());
+            GraphFreshness::Behind { sha, commits }
+        }
+        // No HEAD to compare against: we know where the graph sits but not
+        // whether that is current. Saying "current" here would be a guess.
+        None => GraphFreshness::Behind { sha, commits: None },
+    }
 }
 
 /// Probe one repo. Shells out to `git` rather than linking libgit2: these are
@@ -154,6 +250,8 @@ pub async fn probe(path: &Path, last_used: Option<String>) -> RepoProbe {
         _ => (dir_name(path), false),
     };
 
+    let graph = graph_freshness(path, head_sha.as_deref()).await;
+
     let (recency, recency_source) = match (last_used.clone(), head_time.clone()) {
         (Some(lu), _) => (Some(lu), RecencySource::LastUsed),
         (None, Some(ht)) => (Some(ht), RecencySource::HeadCommit),
@@ -168,6 +266,7 @@ pub async fn probe(path: &Path, last_used: Option<String>) -> RepoProbe {
         agent_name: yml.agent_name,
         kit: yml.kit,
         optional_kits: yml.optional_kits,
+        graph,
         head_sha,
         head_time,
         commit_count: count.and_then(|c| c.parse().ok()),
@@ -192,4 +291,120 @@ pub async fn probe_all(rows: Vec<(PathBuf, Option<String>)>) -> Vec<RepoProbe> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(dir: &Path) -> String {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        for n in 0..3 {
+            std::fs::write(dir.join(format!("f{n}")), "x").unwrap();
+            run(&["add", "-A"]);
+            run(&["commit", "-qm", &format!("c{n}")]);
+        }
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn spine(dir: &Path, sha: &str) {
+        let d = dir.join(".lex/_ignore/spine");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("{sha}.spine.tsv")), "x").unwrap();
+    }
+
+    /// The four states must stay four. A soul with a store but no spine, and
+    /// a soul with nothing at all, are both "I cannot answer that" — and the
+    /// one thing neither may ever become is `Current`, because `Current` is
+    /// the answer that stops someone looking.
+    #[tokio::test]
+    async fn unanswerable_is_never_reported_as_current() {
+        let tmp = std::env::temp_dir().join(format!("glui-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let head = repo(&tmp);
+
+        // No store, no spine.
+        assert!(matches!(
+            graph_freshness(&tmp, Some(&head)).await,
+            GraphFreshness::NeverSynced
+        ));
+
+        // A store, but nothing naming its position.
+        std::fs::create_dir_all(tmp.join(".lex/_ignore/oxigraph")).unwrap();
+        assert!(matches!(
+            graph_freshness(&tmp, Some(&head)).await,
+            GraphFreshness::Unplaceable
+        ));
+
+        // A spine at HEAD is the only thing that earns `Current`.
+        spine(&tmp, &head);
+        assert!(matches!(
+            graph_freshness(&tmp, Some(&head)).await,
+            GraphFreshness::Current { .. }
+        ));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The count is the whole value of the marker, so it has to be a real
+    /// distance, not a boolean dressed as a number. Two commits back must
+    /// read as 2 — and a spine naming a sha this repo has never heard of
+    /// must report `None` rather than 0, since 0 is indistinguishable from
+    /// "up to date" at the glance this marker is designed for.
+    #[tokio::test]
+    async fn behind_carries_a_real_distance_and_admits_when_it_cannot() {
+        let tmp = std::env::temp_dir().join(format!("glui-dist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let head = repo(&tmp);
+        let older = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(["rev-parse", "HEAD~2"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        spine(&tmp, &older);
+        match graph_freshness(&tmp, Some(&head)).await {
+            GraphFreshness::Behind { commits, sha } => {
+                assert_eq!(commits, Some(2), "two commits back must read as 2");
+                assert_eq!(sha, older);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+
+        // A sha from nowhere: the distance is unknowable, and must say so.
+        let _ = std::fs::remove_dir_all(tmp.join(".lex/_ignore/spine"));
+        spine(&tmp, &"a".repeat(40));
+        match graph_freshness(&tmp, Some(&head)).await {
+            GraphFreshness::Behind { commits, .. } => {
+                assert_eq!(commits, None, "an unreachable spine sha must not report 0")
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }

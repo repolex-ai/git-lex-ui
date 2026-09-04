@@ -31,6 +31,61 @@
     visiblePredicates, ontogglepredicate, onlypredicate, onallpredicates,
   }: Props = $props()
 
+  /** The staleness marker for one row: what to draw, and what it means.
+   *
+   *  Measured across the 24 registered souls on 2026-09-03: 13 of the 15 that
+   *  have ever been synced were behind, 74 commits in total. So the common
+   *  case is "behind", and the marker has to be legible at a glance without
+   *  shouting — this is a normal condition, not an error.
+   *
+   *  `unplaceable` and `never-synced` get their own glyph rather than being
+   *  folded into "current". They mean the question was unanswerable from
+   *  disk, and rendering unanswerable as fine is the exact defect this file
+   *  spends its comments warning about. */
+  function stale(r: RepoProbe): { mark: string; cls: string; title: string } | null {
+    const g = r.graph
+    if (!g) return null
+    switch (g.state) {
+      case 'current':
+        return null
+      case 'behind': {
+        const n = g.commits
+        return {
+          mark: n === null ? '\u21ba?' : `\u21ba${n}`,
+          cls: 'behind',
+          title:
+            n === null
+              ? `the graph was built at ${g.sha.slice(0, 8)}, which is not an ancestor of HEAD — history was probably rewritten. Run: git lex sync`
+              : `the graph is ${n} commit${n === 1 ? '' : 's'} behind this repo. It was built at ${g.sha.slice(0, 8)}. Saving does not advance it; only \u2018git lex sync\u2019 does.`,
+        }
+      }
+      case 'unplaceable':
+        return {
+          mark: '\u25cb',
+          cls: 'unknown',
+          title:
+            'a graph store exists but nothing on disk says which commit it was built at, so its age cannot be read without asking a running server. Not the same as up to date.',
+        }
+      case 'never-synced':
+        return {
+          mark: '\u2013',
+          cls: 'unknown',
+          title: 'no graph store at all — this repo has never been synced.',
+        }
+    }
+  }
+
+  /** How many rows we can actually place, and how many of those are behind.
+   *  Stated as "N of M" rather than a bare N, because the denominator is the
+   *  part that says whether the number is worrying. */
+  let placeable = $derived(
+    repos.filter((r) => r.graph && (r.graph.state === 'current' || r.graph.state === 'behind')).length,
+  )
+  let behindCount = $derived(repos.filter((r) => r.graph?.state === 'behind').length)
+  let behindCommits = $derived(
+    repos.reduce((a, r) => a + (r.graph?.state === 'behind' ? (r.graph.commits ?? 0) : 0), 0),
+  )
+
   function dot(r: RepoProbe): string {
     const s = servers[r.path]
     if (!s) return ''
@@ -55,6 +110,10 @@
             <span class="status {dot(r)}"></span>
             <span class="rname">{r.name}</span>
             <span class="rkit">{kitLabel(r.kit)}</span>
+            {#if stale(r)}
+              {@const st = stale(r)!}
+              <span class="rstale {st.cls}" title={st.title}>{st.mark}</span>
+            {/if}
             <span class="rwhen" title={r.recency_source === 'last-used'
               ? 'from the registry — a record of it being opened'
               : "the repo's own last commit; the registry had no last_used for it"}>
@@ -65,6 +124,11 @@
       {/each}
     </ul>
     <p class="foot">* ordered by last commit — the registry had no record of it being opened</p>
+    {#if behindCount > 0}
+      <p class="foot warn" title="git lex save commits your work; it does not rebuild the graph. Only git lex sync does. Read from each repo's spine filename, which is named for the commit it was built at.">
+        &#8634; {behindCount} of {placeable} graphs are behind their repo — {behindCommits} commits unindexed. Run <code>git lex sync</code> in each.
+      </p>
+    {/if}
   </section>
 
   <section class="block">
@@ -197,7 +261,7 @@
   .repo {
     display: grid;
     grid-template-columns: 8px 1fr auto;
-    grid-template-areas: "s n k" "s w w";
+    grid-template-areas: "s n k" "s w g";
     gap: 0 0.4rem;
     width: 100%;
     text-align: left;
@@ -218,6 +282,14 @@
   .rname { grid-area: n; font-family: var(--display); font-size: 13px; }
   .rkit { grid-area: k; font-size: 10px; color: var(--ink-faint); }
   .rwhen { grid-area: w; font-size: 10px; color: var(--ink-faint); }
+
+  /* The staleness marker. Muted on purpose: 13 of 15 souls carry one, so a
+     loud treatment would make the normal state of the machine look like an
+     outage. It reads as a annotation, and the tooltip carries the fix. */
+  .rstale { grid-area: g; font-size: 10px; font-variant-numeric: tabular-nums; justify-self: end; }
+  .rstale.behind { color: var(--warn); }
+  .rstale.unknown { color: var(--ink-faint); }
+  .repo.active .rstale { color: rgba(255,255,255,0.75); }
 
   .views { display: flex; gap: 0.3rem; }
   .views button { flex: 1; font-size: 11px; padding: 0.2rem 0.3rem; border: 1px solid var(--rule); }
@@ -252,4 +324,6 @@
 
   .foot { font-size: 10px; color: var(--ink-faint); margin: 0.35rem 0 0; }
   .foot.none { color: var(--warn); }
+  .foot.warn { color: var(--warn); }
+  .foot code { font-family: var(--mono); font-size: 10px; }
 </style>

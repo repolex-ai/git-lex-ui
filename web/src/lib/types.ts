@@ -25,6 +25,12 @@ export interface Classified {
   reason: string
 }
 
+export type GraphFreshness =
+  | { state: 'current'; sha: string }
+  | { state: 'behind'; sha: string; commits: number | null }
+  | { state: 'unplaceable' }
+  | { state: 'never-synced' }
+
 export interface RepoProbe {
   path: string
   genesis_sha: string | null
@@ -39,6 +45,11 @@ export interface RepoProbe {
   commit_count: number | null
   recency: string | null
   recency_source: RecencySource
+  /** Where the persisted graph sits relative to HEAD. Read from the spine
+   *  filename. `unplaceable` and `never-synced` are NOT "fine" — they mean
+   *  the question could not be answered from disk, and must not render as
+   *  current. */
+  graph: GraphFreshness
   has_www: boolean
   warnings: string[]
 }
