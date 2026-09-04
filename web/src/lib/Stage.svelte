@@ -111,10 +111,107 @@
     needsFit = true
     invalidate()
   })
+  // --- chronological replay ----------------------------------------------
+  //
+  // Links appear in the order they were actually created. This is not
+  // inferred from the ages of the two documents — git-lex reifies every
+  // statement and records the commit that asserted it, so each link carries
+  // its own birthday and the ordering is read rather than guessed.
+  //
+  // A link whose birthday the store does not record is held back until the
+  // very end rather than shown at ordinal 0. Zero would mean "this existed
+  // from the beginning", which is a confident claim about history and, for a
+  // link we know nothing about, the wrong one.
+  let playhead = $state<number | null>(null)
+  let playing = $state(false)
+  let playRaf = 0
+
+  // The sweep runs over the LINKS' own range, not the documents'.
+  //
+  // On W3BL0RD the first document is born at commit 60 and the first link is
+  // asserted at 130, so sweeping the document range spent the first 40% of
+  // the animation showing nothing happen. Measured before changing it: 194
+  // links across 28 distinct commits, 130 to 184.
+  const linkRange = $derived.by(() => {
+    if (!r || r.edgeBorn.length === 0) return null
+    let lo = Infinity
+    let hi = -Infinity
+    for (const b of r.edgeBorn) {
+      if (b === 0xffffffff) continue
+      if (b < lo) lo = b
+      if (b > hi) hi = b
+    }
+    return Number.isFinite(lo) && hi > lo ? { lo, hi } : null
+  })
+  // One less than the first link's commit, so the replay opens on an empty
+  // graph. Starting exactly at `lo` put 49 of W3BL0RD's 194 links on screen
+  // in the first frame — that commit really did assert 49 at once, and the
+  // burst reads as history rather than as a slow start only if you see the
+  // moment before it.
+  const FIRST = $derived(linkRange ? linkRange.lo - 1 : (meta?.first_ordinal ?? 0))
+  const LAST = $derived(linkRange?.hi ?? meta?.last_ordinal ?? 0)
+  /** Seconds for a full sweep, whatever the repo's length. A soul with 3,500
+   *  commits and one with 180 both want to be watched, not waited out. */
+  const SWEEP_MS = 14000
+
+  /** Edges visible now: the predicate filter, then the playhead. */
+  const timeFiltered = $derived.by(() => {
+    const base = edgeSubset ?? r?.edges ?? null
+    if (!r || playhead === null || !base) return base
+    const out: number[] = []
+    for (let k = 0; k < base.length; k += 2) {
+      const born = r.edgeBorn[k / 2]
+      if (born !== 0xffffffff && born <= playhead) {
+        out.push(base[k], base[k + 1])
+      }
+    }
+    return new Uint32Array(out)
+  })
+
   $effect(() => {
     if (!r) return
-    r.setEdgeSubset(edgeSubset ?? r.edges)
+    r.setEdgeSubset(timeFiltered ?? r.edges)
     invalidate()
+  })
+
+  function stopPlay() {
+    playing = false
+    if (playRaf) cancelAnimationFrame(playRaf)
+    playRaf = 0
+  }
+
+  function togglePlay() {
+    if (playing) {
+      stopPlay()
+      playhead = null
+      return
+    }
+    if (LAST <= FIRST) return
+    playing = true
+    const t0 = performance.now()
+    const step = (t: number) => {
+      const f = Math.min(1, (t - t0) / SWEEP_MS)
+      playhead = FIRST + Math.round(f * (LAST - FIRST))
+      if (f >= 1) {
+        // Land on "everything", including the links with no recorded
+        // birthday, so the end of the replay is the same picture as before
+        // it started. A replay that ends somewhere other than the truth
+        // would quietly become a filter.
+        stopPlay()
+        playhead = null
+        return
+      }
+      playRaf = requestAnimationFrame(step)
+    }
+    playRaf = requestAnimationFrame(step)
+  }
+
+  // Stop if the soul or view changes underneath the replay.
+  $effect(() => {
+    void meta
+    void view
+    stopPlay()
+    playhead = null
   })
   $effect(() => {
     if (r && centreOn !== null) {
@@ -174,7 +271,7 @@
   <div class="bar">
     {#if meta}
       <span class="figure"><b>{shown}</b> of {meta.node_count} nodes</span>
-      <span class="figure"><b>{edgeSubset ? edgeSubset.length / 2 : meta.edge_count}</b> edges</span>
+      <span class="figure"><b>{timeFiltered ? timeFiltered.length / 2 : meta.edge_count}</b> edges</span>
       {#if view === 'spiral'}
         <span class="axis">
           {(meta.turn_dates[0] ?? '').slice(0, 10)} → {(meta.turn_dates[meta.turn_dates.length - 1] ?? '').slice(0, 10)}
@@ -185,6 +282,18 @@
       {/if}
     {/if}
     <span class="spacer"></span>
+    {#if linkRange}
+      <button
+        class="play"
+        onclick={togglePlay}
+        title={playing
+          ? 'stop and show every link'
+          : 'reveal links in the order they were created, read from the commit each was first asserted in'}
+      >{playing ? '\u25a0 stop' : '\u25b6 play links'}</button>
+      {#if playing && playhead !== null}
+        <span class="playhead">commit {playhead} of {LAST}</span>
+      {/if}
+    {/if}
     <label><input type="checkbox" bind:checked={showEdges} onchange={invalidate} /> edges</label>
   </div>
 
@@ -242,6 +351,11 @@
   {#if meta && (meta.dropped.length || meta.undated)}
     <div class="disclose">
       {#if meta.undated}<span><b>{meta.undated}</b> undated, drawn on the rim</span>{/if}
+      {#if meta.links_undated}
+        <span title="The store records no commit for these links, so they cannot be placed on the replay timeline. They appear when the replay finishes.">
+          <b>{meta.links_undated}</b> links with no recorded birthday
+        </span>
+      {/if}
       {#each meta.dropped as d}
         <span>
           <b>{d.count}</b> not drawn — {d.reason}
@@ -289,6 +403,20 @@
   }
   .stale b { color: var(--ink); }
   .stale code { font-size: 10px; }
+
+  .play {
+    font-size: 11px;
+    padding: 0.1rem 0.45rem;
+    border: 1px solid var(--rule);
+    background: none;
+    cursor: pointer;
+  }
+  .play:hover { border-color: var(--ink); }
+  .playhead {
+    font-size: 10px;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+  }
 
   .canvas-wrap { position: relative; flex: 1; min-height: 0; }
   canvas { width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; }

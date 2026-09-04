@@ -32,6 +32,10 @@ export interface LayoutMeta {
   docs: DocMeta[]
   turn_dates: (string | null)[]
   undated: number
+  /** Drawn links the store records no assertion commit for. They cannot be
+   *  placed on the replay timeline, so they are counted here rather than
+   *  silently given ordinal 0. */
+  links_undated: number
   first_ordinal: number | null
   last_ordinal: number | null
   file_subjects: number

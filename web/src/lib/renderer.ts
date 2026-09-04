@@ -26,6 +26,10 @@ export interface LayoutOffsets {
   /** u16 per edge: an index into the layout's predicate table. */
   edge_predicates: number
   edge_predicates_bytes: number
+  /** Commit ordinal each link was first asserted in, parallel to `edges`.
+   *  `0xFFFFFFFF` means the store records no birthday for that link. */
+  edge_born: number
+  edge_born_bytes: number
   total: number
 }
 
@@ -158,6 +162,8 @@ export class GraphRenderer {
 
   readonly n: number
   positions: Float32Array
+  /** When each link was first asserted, one per edge. */
+  edgeBorn: Uint32Array
   /** The spiral track, retained for `fitView`. Empty until `setTrack`. */
   track: Float32Array = new Float32Array(0)
   colors: Uint8Array
@@ -180,6 +186,9 @@ export class GraphRenderer {
     this.n = nodeCount
 
     this.positions = new Float32Array(buffer.slice(offsets.positions, offsets.positions + offsets.positions_bytes))
+    this.edgeBorn = new Uint32Array(
+      buffer.slice(offsets.edge_born, offsets.edge_born + offsets.edge_born_bytes),
+    )
     this.colors = new Uint8Array(buffer.slice(offsets.colors, offsets.colors + offsets.colors_bytes))
     this.sizes = new Float32Array(buffer.slice(offsets.sizes, offsets.sizes + offsets.sizes_bytes))
     this.edges = new Uint32Array(buffer.slice(offsets.edges, offsets.edges + offsets.edges_bytes))

@@ -84,7 +84,13 @@
     width: min(30rem, 42%);
     display: flex;
     flex-direction: column;
-    background: var(--paper);
+    /* Translucent, so the graph stays visible behind the document you
+       opened from it. The blur is what makes that readable rather than
+       noisy: without it, edge lines run straight through the text at full
+       contrast and the prose becomes hard work. */
+    background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: blur(7px) saturate(0.9);
+    -webkit-backdrop-filter: blur(7px) saturate(0.9);
     border: 1px solid var(--ink);
     box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.09);
     z-index: 5;
@@ -96,7 +102,9 @@
     gap: 0.5rem;
     padding: 0.4rem 0.5rem;
     border-bottom: 1px solid var(--rule);
-    background: var(--paper-tint);
+    /* The header stays more solid than the body: it carries the title and
+       the close button, which should never be competing with a graph edge. */
+    background: color-mix(in srgb, var(--paper-tint) 94%, transparent);
   }
   h3 {
     margin: 0;

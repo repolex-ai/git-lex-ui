@@ -119,21 +119,23 @@ pub async fn build_from_server(
         None => None,
     };
 
-    let (qn, qe, qa, qb, qd, ql) = (
+    let (qn, qe, qa, qb, qd, ql, qlb) = (
         layout::q_nodes(),
         layout::q_edges(),
         layout::q_alias(),
         layout::q_born(),
         layout::q_dates(),
         layout::q_labels(),
+        layout::q_link_born(),
     );
-    let (nodes, edges, aliases, born, dates, labels) = tokio::join!(
+    let (nodes, edges, aliases, born, dates, labels, link_born) = tokio::join!(
         c.query::<layout::NodeRow>(&qn),
         c.query::<layout::EdgeRow>(&qe),
         c.query::<layout::AliasRow>(&qa),
         c.query::<layout::BornRow>(&qb),
         c.query::<layout::DateRow>(&qd),
         c.query::<layout::LabelRow>(&ql),
+        c.query::<layout::LinkBornRow>(&qlb),
     );
 
     let nodes = nodes?;
@@ -152,6 +154,7 @@ pub async fn build_from_server(
         head,
         nodes,
         edges.unwrap_or_default(),
+        link_born.unwrap_or_default(),
         aliases.unwrap_or_default(),
         born.unwrap_or_default(),
         dates.unwrap_or_default(),

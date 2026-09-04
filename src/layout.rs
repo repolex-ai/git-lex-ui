@@ -118,6 +118,49 @@ pub fn q_nodes() -> String {
 /// itself. Dangling targets are deliberately kept — resolution happens in
 /// `build`, where an unresolvable target is counted and disclosed rather than
 /// filtered out here where nobody would ever see it.
+/// When each link was first asserted, as a commit ordinal.
+///
+/// This is the real creation order, not a guess from the endpoints' ages.
+/// git-lex reifies every statement and records the commit that asserted it,
+/// so a link carries its own birthday: `?e rdf:reifies <<( ?s ?p ?o )>> ;
+/// gl:assertedIn ?c`. Measured on W3BL0RD: 3,083 reified statements, of which
+/// `md:linksTo` is the single most common at 731, spread across commits
+/// 1-184. `gl:relatedToId` is reified too, 25 of them, all late (154-180) —
+/// which is itself true history, since the declared-reference vocabulary only
+/// arrived recently.
+///
+/// MIN because a statement is re-asserted every time its file is touched;
+/// the first assertion is when the link came into being.
+///
+/// Worth recording how nearly this was not built: the first version of this
+/// query named the wrong graph and returned zero rows, which reads exactly
+/// like "the store does not have this" — the answer that would have had me
+/// tell Rob it was not possible. The control (count reified statements at
+/// all) is what separated a wrong query from a real absence. See
+/// `feedback-a-label-is-a-claim-with-no-test`.
+pub fn q_link_born() -> String {
+    format!(
+        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
+         PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         SELECT ?from ?predicate ?target (MIN(?ord) AS ?born) WHERE {{
+             GRAPH <{ONE_GRAPH}> {{
+                 ?e rdf:reifies <<( ?s ?p ?o )>> ; gl:assertedIn ?c
+             }}
+             GRAPH <{COMMITS}> {{ ?c g2:ordinalDerived ?ord }}
+             FILTER(isIRI(?o))
+             FILTER(?s != ?o)
+             FILTER(?p != rdf:type)
+             FILTER(?p != gl:fileId)
+             FILTER(?p != gl:id)
+             FILTER(!STRSTARTS(STR(?o), \"https://repolex.ai/ontology/\"))
+             BIND(STR(?s) AS ?from)
+             BIND(STR(?p) AS ?predicate)
+             BIND(STR(?o) AS ?target)
+         }} GROUP BY ?from ?predicate ?target"
+    )
+}
+
 pub fn q_edges() -> String {
     format!(
         "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
@@ -264,6 +307,10 @@ pub struct LayoutMeta {
     /// How many documents nothing could date. They sit on the rim, and they
     /// are counted here rather than being quietly placed as if they were new.
     pub undated: usize,
+    /// Drawn links for which the store records no assertion commit. These
+    /// cannot take part in a chronological replay, so the count is shown
+    /// rather than folded into the timeline at ordinal 0.
+    pub links_undated: usize,
     /// The commit ordinals the spiral actually spans — the birth commit of
     /// the oldest surviving document, and of the newest.
     ///
@@ -313,6 +360,10 @@ pub struct Offsets {
     /// u16 per edge: an index into `predicates`.
     pub edge_predicates: usize,
     pub edge_predicates_bytes: usize,
+    /// Commit ordinal each link was first asserted in, u32 per edge, parallel
+    /// to `edges`. `u32::MAX` means the store records no birthday for it.
+    pub edge_born: usize,
+    pub edge_born_bytes: usize,
     pub total: usize,
 }
 
@@ -337,6 +388,15 @@ pub struct EdgeRow {
     pub target: String,
     #[serde(default)]
     pub predicate: Option<String>,
+}
+
+/// One link and the commit ordinal it was first asserted in.
+#[derive(serde::Deserialize)]
+pub struct LinkBornRow {
+    pub from: String,
+    pub predicate: String,
+    pub target: String,
+    pub born: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -415,6 +475,7 @@ pub fn build(
     head_sha: &str,
     nodes: Vec<NodeRow>,
     edges: Vec<EdgeRow>,
+    link_born_rows: Vec<LinkBornRow>,
     aliases: Vec<AliasRow>,
     born_rows: Vec<BornRow>,
     date_rows: Vec<DateRow>,
@@ -678,6 +739,21 @@ pub fn build(
         docs.iter().enumerate().map(|(i, d)| (d.id.as_str(), i as u32)).collect();
     let mut edge_pairs: Vec<u32> = Vec::with_capacity(edges.len() * 2);
     let mut edge_preds: Vec<String> = Vec::with_capacity(edges.len());
+    // When each link was first asserted, keyed the same way the edge is —
+    // AFTER folding the Thing plane onto the File plane, or a Thing-plane
+    // link would never match the folded edge it produced.
+    let link_born: HashMap<(String, String, String), u32> = link_born_rows
+        .iter()
+        .filter_map(|r| {
+            let ord: u32 = r.born.parse().ok()?;
+            Some(((fold(&r.from), r.predicate.clone(), fold(&r.target)), ord))
+        })
+        .collect();
+    let mut edge_born: Vec<u32> = Vec::with_capacity(edges.len());
+    // Links whose birthday the store does not record. Counted and reported,
+    // never quietly given ordinal 0 — 0 is "at the very beginning", which is
+    // a confident claim about history and the wrong one.
+    let mut links_undated = 0usize;
     let mut missing_target: Vec<String> = Vec::new();
     let mut missing_source: Vec<String> = Vec::new();
     let mut target_by_pred: HashMap<String, usize> = HashMap::new();
@@ -697,6 +773,14 @@ pub fn build(
                 }
                 edge_pairs.push(ai);
                 edge_pairs.push(bi);
+                let key = (a.clone(), pred.clone(), b.clone());
+                match link_born.get(&key) {
+                    Some(&o) => edge_born.push(o),
+                    None => {
+                        links_undated += 1;
+                        edge_born.push(u32::MAX);
+                    }
+                }
                 edge_preds.push(pred);
             }
             (Some(_), None) => {
@@ -807,13 +891,15 @@ pub fn build(
     let siz_bytes = sizes.len() * 4;
     let edg_bytes = edge_pairs.len() * 4;
     let ep_bytes = edge_pred_idx.len() * 2;
+    let eb_bytes = edge_born.len() * 4;
 
     let pos_at = 0;
     let col_at = align4(pos_at + pos_bytes);
     let siz_at = align4(col_at + col_bytes);
     let edg_at = align4(siz_at + siz_bytes);
     let ep_at = align4(edg_at + edg_bytes);
-    let total = ep_at + ep_bytes;
+    let eb_at = align4(ep_at + ep_bytes);
+    let total = eb_at + eb_bytes;
 
     let mut data = vec![0u8; total];
     for (i, v) in positions.iter().enumerate() {
@@ -828,6 +914,9 @@ pub fn build(
     }
     for (i, v) in edge_pred_idx.iter().enumerate() {
         data[ep_at + i * 2..ep_at + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in edge_born.iter().enumerate() {
+        data[eb_at + i * 4..eb_at + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
 
     let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
@@ -865,6 +954,7 @@ pub fn build(
             docs: doc_meta,
             turn_dates,
             undated,
+            links_undated,
             first_ordinal: if dated.is_empty() { None } else { Some(min_b) },
             last_ordinal: if dated.is_empty() { None } else { Some(max_b) },
             file_subjects,
@@ -883,6 +973,8 @@ pub fn build(
                 edges_bytes: edg_bytes,
                 edge_predicates: ep_at,
                 edge_predicates_bytes: ep_bytes,
+                edge_born: eb_at,
+                edge_born_bytes: eb_bytes,
                 total,
             },
         },
@@ -924,7 +1016,7 @@ mod tests {
         let node_rows = nodes.len();
 
         let t0 = std::time::Instant::now();
-        let l = build("genesis", "head", nodes, edges, aliases, born, dates, labels, None, None);
+        let l = build("genesis", "head", nodes, edges, Vec::new(), aliases, born, dates, labels, None, None);
         let elapsed = t0.elapsed();
 
         eprintln!(
@@ -971,6 +1063,7 @@ mod tests {
             "head",
             rows(&dir, "lux_nodes.json"),
             rows(&dir, "lux_edges.json"),
+            Vec::new(),
             rows(&dir, "lux_alias.json"),
             rows(&dir, "lux_born.json"),
             rows(&dir, "lux_dates.json"),
@@ -1010,7 +1103,7 @@ mod tests {
             born.push(BornRow { s: id, born: o.into(), events: "1".into() });
         }
 
-        let l = build("g", "h", nodes, vec![], vec![], born, vec![], vec![], None, None);
+        let l = build("g", "h", nodes, vec![], vec![], vec![], born, vec![], vec![], None, None);
         let turns = l.meta.turns as f32;
 
         // Recover each cohort member's angle and radius.
