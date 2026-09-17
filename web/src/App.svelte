@@ -3,7 +3,7 @@
   import type { ReposResponse, RepoProbe, ServerStatus } from './lib/types'
   import {
     loadLayout, Adjacency, trackPoints, neighbourhoodPositions, edgesToDraw,
-    computeStates, type LayoutMeta,
+    computeStates, type LayoutMeta, type Reading,
   } from './lib/graph'
   import type { GraphRenderer } from './lib/renderer'
   import LeftRail from './lib/LeftRail.svelte'
@@ -71,6 +71,21 @@
     }
   })
   let view = $state<'spiral' | 'neighbourhood'>('spiral')
+
+  // --- base or typed ------------------------------------------------------
+  //
+  // Every repo has a base reading. A repo with no kit opens in it; a kitted
+  // repo opens typed, and falls back to base when its store has nothing
+  // typed, with a note saying so rather than an error where a picture could
+  // have been.
+  let reading = $state<Reading>('base')
+  let readingNote = $state<string | null>(null)
+  const defaultReading = (repo: RepoProbe): Reading =>
+    repo.family.family === 'plain' ? 'base' : 'typed'
+  function readingFromUrl(): Reading | null {
+    const v = new URLSearchParams(location.search).get('reading')
+    return v === 'base' || v === 'typed' ? v : null
+  }
   let centreOn = $state<number | null>(null)
   let hops = 2
 
@@ -108,7 +123,7 @@
       if (finished.length) {
         await loadRepos()
         const open = current
-        if (open && finished.some(([p]) => p === open.path)) await openRepo(open)
+        if (open && finished.some(([p]) => p === open.path)) await openRepo(open, reading)
       }
       if (!Object.values(next).some((st) => st.state === 'running') && syncTimer) {
         clearInterval(syncTimer)
@@ -141,9 +156,12 @@
     }
   })
 
-  async function openRepo(repo: RepoProbe) {
+  async function openRepo(repo: RepoProbe, want?: Reading) {
     busy = repo.path
     layoutErr = null
+    // Keep the open document across a change of reading when it exists in
+    // both — the same file is the same dot's subject either way.
+    const keepDoc = current?.path === repo.path && meta && selected !== null ? meta.docs[selected].id : null
     try {
       const st = await api.open(repo.path)
       servers = { ...servers, [repo.path]: st }
@@ -151,15 +169,27 @@
         layoutErr = st.message ?? `server is ${st.state}`
         return
       }
+      const sameRepo = current?.path === repo.path
       current = repo
 
       meta = null
       buffer = null
       selected = null
-      search = ''
+      if (!sameRepo) search = ''
       view = 'spiral'
+      readingNote = null
 
-      const l = await loadLayout(repo.genesis_sha!)
+      const first = want ?? readingFromUrl() ?? defaultReading(repo)
+      let l
+      try {
+        l = await loadLayout(repo.genesis_sha!, first)
+        reading = first
+      } catch (e) {
+        if (first !== 'typed') throw e
+        l = await loadLayout(repo.genesis_sha!, 'base')
+        reading = 'base'
+        readingNote = `Showing the base view — the types view is not available: ${e instanceof Error ? e.message : String(e)}`
+      }
       meta = l.meta
       buffer = l.buffer
       adj = new Adjacency(l.meta.node_count, new Uint32Array(
@@ -186,15 +216,18 @@
         if (picked.length) visiblePredicates = new Set(picked)
       }
 
-      const want = new URLSearchParams(location.search).get('doc')
-      if (want) {
-        const i = l.meta.docs.findIndex((d) => d.id === want)
+      const wantDoc = keepDoc ?? new URLSearchParams(location.search).get('doc')
+      if (wantDoc) {
+        const i = l.meta.docs.findIndex((d) => d.id === wantDoc)
         if (i >= 0) {
           selected = i
           centreOn = i
           queueMicrotask(() => (centreOn = null))
         }
       }
+      // The address names the reading that is actually on screen, including
+      // after a fallback, so a pasted link never promises the other one.
+      writeUrl(repo, selected)
     } catch (e) {
       layoutErr = e instanceof Error ? e.message : String(e)
     } finally {
@@ -265,6 +298,7 @@
   function writeUrl(repo: RepoProbe | null, doc: number | null) {
     if (!repo?.genesis_sha) return
     const q = new URLSearchParams()
+    if (reading !== defaultReading(repo)) q.set('reading', reading)
     if (doc !== null && meta) q.set('doc', meta.docs[doc].id)
     if (meta && visiblePredicates.size < meta.predicates.length) {
       q.set(
@@ -318,6 +352,10 @@
   function setView(v: 'spiral' | 'neighbourhood') {
     view = v
   }
+  async function setReading(r: Reading) {
+    if (!current || r === reading) return
+    await openRepo(current, r)
+  }
   function onReady(_r: GraphRenderer) { /* renderer owned by the stage */ }
 </script>
 
@@ -331,7 +369,7 @@
         <span class="head">commit {meta.head_sha.slice(0, 8)}</span>
       {/if}
     {:else}
-      <span class="path">no soul open</span>
+      <span class="path">no repo open</span>
     {/if}
     <span class="spacer"></span>
     {#if data}
@@ -354,8 +392,10 @@
     {search}
     matchCount={computed?.matches.length ?? 0}
     {view}
+    {reading}
+    onreading={setReading}
     hasSelection={selected !== null}
-    onpick={openRepo}
+    onpick={(r) => openRepo(r, defaultReading(r))}
     {syncs}
     onsync={startSync}
     ontoggle={toggleClass}
@@ -378,6 +418,7 @@
     {edgeSubset}
     {selected}
     {view}
+    {readingNote}
     {centreOn}
     onselect={select}
     onready={onReady}

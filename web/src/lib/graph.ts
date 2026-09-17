@@ -18,7 +18,14 @@ export interface Dropped {
   by_predicate?: [string, number][]
 }
 
+/** Which reading of a repo a layout is. `base` is every markdown file by
+ *  folder, dated by git, and works for any repo; `typed` is documents from
+ *  the store's `now` view, coloured by type, and needs a kit to have typed
+ *  something. */
+export type Reading = 'base' | 'typed'
+
 export interface LayoutMeta {
+  view: Reading
   genesis_sha: string
   head_sha: string
   store_head: string | null
@@ -41,6 +48,10 @@ export interface LayoutMeta {
   file_subjects: number
   folded_files: number
   unbridged_things: number
+  /** Base reading only: tracked files that are not markdown, and markdown
+   *  under `.lex/`. Neither is drawn; both are counted. */
+  other_files: number
+  machinery_files: number
   titled: number
   dropped: Dropped[]
   offsets: LayoutOffsets
@@ -52,12 +63,12 @@ export interface Loaded {
   source: string
 }
 
-export async function loadLayout(genesis: string): Promise<Loaded> {
-  const mr = await fetch(`/api/layout/${genesis}`)
+export async function loadLayout(genesis: string, reading: Reading): Promise<Loaded> {
+  const mr = await fetch(`/api/layout/${genesis}?view=${reading}`)
   if (!mr.ok) throw new Error(await mr.text())
   const source = mr.headers.get('x-layout-source') ?? ''
   const meta: LayoutMeta = await mr.json()
-  const dr = await fetch(`/api/layout/${genesis}/data`)
+  const dr = await fetch(`/api/layout/${genesis}/data?view=${reading}`)
   if (!dr.ok) throw new Error(await dr.text())
   return { meta, buffer: await dr.arrayBuffer(), source }
 }

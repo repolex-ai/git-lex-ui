@@ -1,4 +1,10 @@
-//! The Whole Soul layout, computed server-side.
+//! The whole-repo spiral layout, computed server-side.
+//!
+//! Two readings share it (see [`View`]): **base**, every markdown file by
+//! folder and dated by git, which works for any repo; and **typed**,
+//! documents the kit has typed, coloured by type. They differ only in which
+//! documents they collect and how they group them — `place_and_pack` below is
+//! the one piece that draws both.
 //!
 //! A document's position is **when it first appeared**, drawn as a spiral:
 //! centre is the first commit, rim is now, one turn is one slice of the
@@ -217,6 +223,30 @@ pub fn q_labels() -> String {
     )
 }
 
+/// Every file the store's tree lists at the commit it was synced from.
+///
+/// This is the one listing every synced repo has, typed or not. The `now`
+/// view is built from frontmatter and links, so a repo whose markdown carries
+/// neither can have no `now` view at all — git-lex itself is one — while its
+/// file tree is complete.
+pub fn q_filetree(store_head: &str) -> String {
+    format!(
+        "PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
+         SELECT ?path WHERE {{
+             GRAPH <https://repolex.ai/git-lex/NamedGraph/filetree/{store_head}> {{ ?e g2:path ?path }}
+         }}"
+    )
+}
+
+/// Commit sha to the store's ordinal, so a date git gives us lands on the
+/// same axis as the store's own link birthdays.
+pub fn q_ordinals() -> String {
+    format!(
+        "PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
+         SELECT ?id ?ord WHERE {{ GRAPH <{COMMITS}> {{ ?c g2:id ?id ; g2:ordinalDerived ?ord }} }}"
+    )
+}
+
 /// Two anchors and a direction is all an axis needs. Without dates the ticks
 /// can say a turn closed but nothing about when.
 pub fn q_dates() -> String {
@@ -281,8 +311,43 @@ pub struct Dropped {
     pub by_predicate: Vec<(String, usize)>,
 }
 
+/// Which reading of a repo a layout is.
+///
+/// **Base** works for any git-lex repo, kit or no kit: every markdown file
+/// the store's file tree lists, placed by the commit git says it first
+/// appeared in, coloured by folder. It needs nothing from frontmatter, which
+/// is the point — git-lex's base case is a folder of markdown files, and a
+/// view that only draws typed documents draws nothing for that case. Decided
+/// with @goodlux on 2026-09-17, as the layer every kit view sits on top of.
+///
+/// **Typed** is the original view: documents from the store's `now` view,
+/// coloured by class. It needs a kit to have typed something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum View {
+    Base,
+    Typed,
+}
+
+impl View {
+    pub fn parse(s: &str) -> Option<View> {
+        match s {
+            "base" => Some(View::Base),
+            "typed" => Some(View::Typed),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            View::Base => "base",
+            View::Typed => "typed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LayoutMeta {
+    pub view: View,
     pub genesis_sha: String,
     /// The repo's HEAD, read from git at request time.
     pub head_sha: String,
@@ -334,6 +399,13 @@ pub struct LayoutMeta {
     /// Things whose `gl:fileId` names a file that is not itself in the node
     /// set. They are still drawn, under their own class.
     pub unbridged_things: usize,
+    /// Base view only: files in the tree that are not markdown, and so are
+    /// not drawn. Counted so a code repo does not read as a tiny one.
+    pub other_files: usize,
+    /// Base view only: markdown under `.lex/`, which is git-lex's own
+    /// machinery (kit copies, the compact ontology) rather than anybody's
+    /// writing. Left out of the picture, and counted.
+    pub machinery_files: usize,
     /// How many documents got a real title rather than falling back to their
     /// slug. Printed, because "titles are resolved" is a claim and this is
     /// its test.
@@ -423,6 +495,46 @@ pub struct LabelRow {
 pub struct StoreHeadRow {
     pub id: String,
     pub ord: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PathRow {
+    pub path: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct OrdinalRow {
+    pub id: String,
+    pub ord: String,
+}
+
+/// What git says about one path: the oldest commit it appears in, and how
+/// many commits touched it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PathHistory {
+    pub first_sha: String,
+    pub commits: u32,
+}
+
+/// Read `git log --no-renames --format=%x00%H --name-only` output.
+///
+/// The log runs newest first, so the last commit seen for a path is the one
+/// it first appeared in. `--no-renames` is deliberate: a renamed file counts
+/// as appearing at its new path in the commit that moved it, which is when a
+/// document at that path began to exist. Following renames would date it to
+/// a path the picture does not show.
+pub fn parse_git_log(out: &str) -> HashMap<String, PathHistory> {
+    let mut map: HashMap<String, PathHistory> = HashMap::new();
+    for block in out.split('\0').skip(1) {
+        let mut lines = block.lines();
+        let Some(sha) = lines.next().map(str::trim) else { continue };
+        for path in lines.map(str::trim).filter(|l| !l.is_empty()) {
+            let e = map.entry(path.to_string()).or_default();
+            e.first_sha = sha.to_string();
+            e.commits += 1;
+        }
+    }
+    map
 }
 
 #[derive(serde::Deserialize)]
@@ -544,18 +656,7 @@ pub fn build(
         e.twins.insert(r.id.clone());
     }
 
-    struct Doc {
-        id: String,
-        ty: String,
-        label: String,
-        twins_have_label: bool,
-        born: Option<i64>,
-        events: u32,
-        group_idx: usize,
-        group_size: usize,
-    }
-
-    let mut docs: Vec<Doc> = by_subject
+    let docs: Vec<Placed> = by_subject
         .into_values()
         .filter_map(|e| {
             // The most specific type wins: a document that is both a File and
@@ -600,26 +701,21 @@ pub fn build(
                 .iter()
                 .map(|t| events_of.get(t.as_str()).copied().unwrap_or(0))
                 .sum();
-            Some(Doc {
+            Some(Placed {
                 id: e.id,
-                ty,
-                twins_have_label: resolved_present,
+                group: ty,
+                titled: resolved_present,
                 label,
                 born,
                 events,
-                group_idx: 0,
-                group_size: 1,
             })
         })
         .collect();
 
-    // Stable order, so the same soul packs identically twice running.
-    docs.sort_by(|a, b| a.id.cmp(&b.id));
-
     // --- classes ----------------------------------------------------------
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for d in &docs {
-        *counts.entry(d.ty.as_str()).or_insert(0) += 1;
+        *counts.entry(d.group.as_str()).or_insert(0) += 1;
     }
     let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -652,19 +748,283 @@ pub fn build(
             color: "#b9b9bd".to_string(),
         });
     }
+    let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
+    place_and_pack(
+        Shared { genesis_sha, head_sha, store_head, commits_behind },
+        docs,
+        classes,
+        &fold,
+        edges,
+        link_born_rows,
+        date_rows,
+        Census {
+            view: View::Typed,
+            file_subjects,
+            folded_files: file_subjects.saturating_sub(file_only),
+            unbridged_things,
+            other_files: 0,
+            machinery_files: 0,
+        },
+    )
+}
+
+pub const FILE_PREFIX: &str = "https://repolex.ai/git-lex/File/";
+
+fn is_markdown(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    l.ends_with(".md") || l.ends_with(".markdown")
+}
+
+/// A folder is split one level further when it holds more than this share of
+/// the documents. lUX keeps 94% of its markdown under `Copia/`; coloured by
+/// top folder that is a one-colour picture that says nothing. A third, not a
+/// majority: at 60% W3BL0RD (51% `Soul/`) still drew every journal, note and
+/// exploration in one colour, which is the one distinction a soul's owner
+/// most wants to see. At most two folders can pass a third, so the legend
+/// stays short.
+const SPLIT_SHARE: f64 = 1.0 / 3.0;
+/// Folders past this many get one shared grey entry, so the palette is never
+/// reused for two different folders.
+const MAX_FOLDERS: usize = 11;
+
+fn top(path: &str) -> &str {
+    match path.find('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+fn two_deep(path: &str) -> &str {
+    let Some(a) = path.find('/') else { return "" };
+    match path[a + 1..].find('/') {
+        Some(b) => &path[..a + 1 + b],
+        None => &path[..a],
+    }
+}
+
+/// The base view: every markdown file, by folder, dated by git.
+#[allow(clippy::too_many_arguments)]
+pub fn build_base(
+    genesis_sha: &str,
+    head_sha: &str,
+    tree: Vec<PathRow>,
+    history: &HashMap<String, PathHistory>,
+    ordinals: Vec<OrdinalRow>,
+    edges: Vec<EdgeRow>,
+    link_born_rows: Vec<LinkBornRow>,
+    aliases: Vec<AliasRow>,
+    date_rows: Vec<DateRow>,
+    label_rows: Vec<LabelRow>,
+    store_head: Option<String>,
+    commits_behind: Option<usize>,
+) -> Layout {
+    let ord_of: HashMap<&str, i64> = ordinals
+        .iter()
+        .filter_map(|r| r.ord.parse().ok().map(|o| (r.id.as_str(), o)))
+        .collect();
+
+    let mut paths: Vec<&str> = Vec::new();
+    let mut other_files = 0usize;
+    let mut machinery_files = 0usize;
+    let mut seen: HashSet<&str> = HashSet::new();
+    for r in &tree {
+        if !seen.insert(r.path.as_str()) {
+            continue;
+        }
+        if !is_markdown(&r.path) {
+            other_files += 1;
+        } else if r.path.starts_with(".lex/") {
+            machinery_files += 1;
+        } else {
+            paths.push(r.path.as_str());
+        }
+    }
+
+    // Folder for each path: the top folder, unless that folder is most of
+    // the repo, in which case its subfolders.
+    let mut top_counts: HashMap<&str, usize> = HashMap::new();
+    for p in &paths {
+        *top_counts.entry(top(p)).or_insert(0) += 1;
+    }
+    let split: HashSet<&str> = top_counts
+        .iter()
+        .filter(|(k, c)| !k.is_empty() && **c as f64 > paths.len() as f64 * SPLIT_SHARE)
+        .map(|(k, _)| *k)
+        .collect();
+    let folder_of = |p: &str| -> String {
+        let t = top(p);
+        if split.contains(t) { two_deep(p).to_string() } else { t.to_string() }
+    };
+
+    let mut folder_counts: HashMap<String, usize> = HashMap::new();
+    for p in &paths {
+        *folder_counts.entry(folder_of(p)).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = folder_counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let named: HashSet<String> = ranked
+        .iter()
+        .filter(|(f, _)| !f.is_empty())
+        .take(MAX_FOLDERS)
+        .map(|(f, _)| f.clone())
+        .collect();
+    const ROOT: &str = "(top level)";
+    const REST: &str = "(other folders)";
+    let legend_key = |p: &str| -> String {
+        let f = folder_of(p);
+        if f.is_empty() {
+            ROOT.to_string()
+        } else if named.contains(&f) {
+            f
+        } else {
+            REST.to_string()
+        }
+    };
+
+    // Titles, where a document declares one. The base view reads them but
+    // never needs them: a file name is always there.
+    let file_of_thing: HashMap<&str, &str> =
+        aliases.iter().map(|a| (a.thing.as_str(), a.file.as_str())).collect();
+    let fold = |id: &str| -> String {
+        file_of_thing.get(id).map(|s| s.to_string()).unwrap_or_else(|| id.to_string())
+    };
+    let mut best_label: HashMap<String, (u8, String)> = HashMap::new();
+    for r in &label_rows {
+        let rank: u8 = r.rank.parse().unwrap_or(9);
+        let k = fold(&r.s);
+        let e = best_label.entry(k).or_insert((rank, r.label.clone()));
+        if rank < e.0 {
+            *e = (rank, r.label.clone());
+        }
+    }
+
+    let docs: Vec<Placed> = paths
+        .iter()
+        .map(|p| {
+            let id = format!("{FILE_PREFIX}{p}");
+            let h = history.get(*p);
+            let label = best_label.get(&id).map(|(_, l)| l.clone());
+            Placed {
+                titled: label.is_some(),
+                label: label.unwrap_or_else(|| short_name(p)),
+                group: legend_key(p),
+                born: h.and_then(|h| ord_of.get(h.first_sha.as_str()).copied()),
+                events: h.map_or(0, |h| h.commits),
+                id,
+            }
+        })
+        .collect();
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for d in &docs {
+        *counts.entry(d.group.as_str()).or_insert(0) += 1;
+    }
+    let mut order: Vec<(&str, usize)> = counts.into_iter().collect();
+    // Real folders first by size; the top level and the catch-all go last,
+    // in grey, because neither is a place anyone chose.
+    let rank = |k: &str| match k {
+        ROOT => 1,
+        REST => 2,
+        _ => 0,
+    };
+    order.sort_by(|a, b| rank(a.0).cmp(&rank(b.0)).then(b.1.cmp(&a.1)).then(a.0.cmp(b.0)));
+    let classes: Vec<ClassInfo> = order
+        .iter()
+        .enumerate()
+        .map(|(i, (k, c))| ClassInfo {
+            uri: k.to_string(),
+            name: if rank(k) == 0 { format!("{k}/") } else { k.to_string() },
+            count: *c,
+            color: match rank(k) {
+                0 => color_for(i),
+                1 => "#8d8d93".to_string(),
+                _ => "#c4c4c9".to_string(),
+            },
+        })
+        .collect();
+
+    place_and_pack(
+        Shared { genesis_sha, head_sha, store_head, commits_behind },
+        docs,
+        classes,
+        &fold,
+        edges,
+        link_born_rows,
+        date_rows,
+        Census {
+            view: View::Base,
+            file_subjects: 0,
+            folded_files: 0,
+            unbridged_things: 0,
+            other_files,
+            machinery_files,
+        },
+    )
+}
+
+/// One document, ready to be placed. Both views reduce to this: the typed
+/// view groups by class, the base view by folder, and nothing below that
+/// point knows which one it was given.
+struct Placed {
+    id: String,
+    label: String,
+    /// The legend entry this document belongs to — a class IRI or a folder.
+    group: String,
+    /// Whether `label` is a real title rather than the file name.
+    titled: bool,
+    born: Option<i64>,
+    events: u32,
+}
+
+struct Shared<'a> {
+    genesis_sha: &'a str,
+    head_sha: &'a str,
+    store_head: Option<String>,
+    commits_behind: Option<usize>,
+}
+
+/// View-specific counts carried through to the metadata unchanged.
+struct Census {
+    view: View,
+    file_subjects: usize,
+    folded_files: usize,
+    unbridged_things: usize,
+    other_files: usize,
+    machinery_files: usize,
+}
+
+/// Place documents on the spiral, resolve links, and pack the result.
+///
+/// Everything here is the same for every view: angle is the birth commit,
+/// size is how often a document changed, colour is its legend entry.
+#[allow(clippy::too_many_arguments)]
+fn place_and_pack(
+    shared: Shared<'_>,
+    mut docs: Vec<Placed>,
+    classes: Vec<ClassInfo>,
+    fold: &dyn Fn(&str) -> String,
+    edges: Vec<EdgeRow>,
+    link_born_rows: Vec<LinkBornRow>,
+    date_rows: Vec<DateRow>,
+    census: Census,
+) -> Layout {
+    // Stable order, so the same repo packs identically twice running.
+    docs.sort_by(|a, b| a.id.cmp(&b.id));
     let class_index: HashMap<&str, usize> =
         classes.iter().enumerate().map(|(i, c)| (c.uri.as_str(), i)).collect();
 
     // --- birth groups -----------------------------------------------------
-    let mut groups: HashMap<i64, Vec<usize>> = HashMap::new();
+    // Position within the cohort of documents born in the same commit.
+    let mut cohorts: HashMap<i64, Vec<usize>> = HashMap::new();
     for (i, d) in docs.iter().enumerate() {
-        groups.entry(d.born.unwrap_or(i64::MIN)).or_default().push(i);
+        cohorts.entry(d.born.unwrap_or(i64::MIN)).or_default().push(i);
     }
-    for g in groups.values() {
-        let size = g.len();
+    let mut cohort_idx = vec![0usize; docs.len()];
+    let mut cohort_size = vec![1usize; docs.len()];
+    for g in cohorts.values() {
         for (k, &i) in g.iter().enumerate() {
-            docs[i].group_idx = k;
-            docs[i].group_size = size;
+            cohort_idx[i] = k;
+            cohort_size[i] = g.len();
         }
     }
 
@@ -706,9 +1066,9 @@ pub fn build(
 
         let turn_gap = 0.86 / turns as f32;
         let spread = (turn_gap * 0.55)
-            .min(0.012 * ((d.group_size as f32 + 1.0).log2()).max(1.0));
-        let across = if d.group_size > 1 {
-            ((d.group_idx as f32 + 0.5) / d.group_size as f32 - 0.5) * 2.0 * spread
+            .min(0.012 * ((cohort_size[i] as f32 + 1.0).log2()).max(1.0));
+        let across = if cohort_size[i] > 1 {
+            ((cohort_idx[i] as f32 + 0.5) / cohort_size[i] as f32 - 0.5) * 2.0 * spread
         } else {
             0.0
         };
@@ -719,7 +1079,7 @@ pub fn build(
         positions[i * 2] = theta.cos() * r + nx * (across + wobble);
         positions[i * 2 + 1] = theta.sin() * r + ny * (across + wobble);
 
-        let ci = class_index.get(d.ty.as_str()).copied().unwrap_or(0);
+        let ci = class_index.get(d.group.as_str()).copied().unwrap_or(0);
         let rgb = hex_rgb(&classes[ci].color);
         colors[i * 3] = rgb[0];
         colors[i * 3 + 1] = rgb[1];
@@ -919,18 +1279,14 @@ pub fn build(
         data[eb_at + i * 4..eb_at + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
 
-    let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
-    let titled = docs
-        .iter()
-        .filter(|d| d.twins_have_label)
-        .count();
+    let titled = docs.iter().filter(|d| d.titled).count();
 
     let doc_meta: Vec<DocMeta> = docs
         .iter()
         .map(|d| DocMeta {
             id: d.id.clone(),
             label: d.label.clone(),
-            class: class_index.get(d.ty.as_str()).copied().unwrap_or(0),
+            class: class_index.get(d.group.as_str()).copied().unwrap_or(0),
             born: d.born,
             events: d.events,
         })
@@ -938,10 +1294,11 @@ pub fn build(
 
     Layout {
         meta: LayoutMeta {
-            genesis_sha: genesis_sha.to_string(),
-            head_sha: head_sha.to_string(),
-            store_head,
-            commits_behind,
+            view: census.view,
+            genesis_sha: shared.genesis_sha.to_string(),
+            head_sha: shared.head_sha.to_string(),
+            store_head: shared.store_head,
+            commits_behind: shared.commits_behind,
             built_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -957,9 +1314,11 @@ pub fn build(
             links_undated,
             first_ordinal: if dated.is_empty() { None } else { Some(min_b) },
             last_ordinal: if dated.is_empty() { None } else { Some(max_b) },
-            file_subjects,
-            folded_files: file_subjects.saturating_sub(file_only),
-            unbridged_things,
+            file_subjects: census.file_subjects,
+            folded_files: census.folded_files,
+            unbridged_things: census.unbridged_things,
+            other_files: census.other_files,
+            machinery_files: census.machinery_files,
             titled,
             dropped,
             offsets: Offsets {
@@ -1137,5 +1496,86 @@ mod tests {
             wedge_degrees < 12.0,
             "a 40-document import spans {wedge_degrees:.1} degrees of arc — angle is time, so that reads as a stretch of work that never happened"
         );
+    }
+
+    /// git lists newest first, so a path's birth is the LAST commit it
+    /// appears under, and every appearance counts as a change.
+    #[test]
+    fn a_path_is_born_in_the_oldest_commit_that_lists_it() {
+        let log = "\0ccc\n\na.md\nb.md\n\0bbb\n\na.md\n\0aaa\n\na.md\n";
+        let h = parse_git_log(log);
+        assert_eq!(h["a.md"], PathHistory { first_sha: "aaa".into(), commits: 3 });
+        assert_eq!(h["b.md"], PathHistory { first_sha: "ccc".into(), commits: 1 });
+        assert_eq!(h.len(), 2);
+    }
+
+    fn tree(paths: &[&str]) -> Vec<PathRow> {
+        paths.iter().map(|p| PathRow { path: p.to_string() }).collect()
+    }
+
+    fn base(paths: &[&str]) -> Layout {
+        let mut history = HashMap::new();
+        for (i, p) in paths.iter().enumerate() {
+            history.insert(p.to_string(), PathHistory { first_sha: format!("c{i}"), commits: 1 });
+        }
+        let ords = (0..paths.len())
+            .map(|i| OrdinalRow { id: format!("c{i}"), ord: (i + 1).to_string() })
+            .collect();
+        build_base("g", "h", tree(paths), &history, ords, vec![], vec![], vec![], vec![], vec![], None, None)
+    }
+
+    /// The base case: markdown with no frontmatter, no kit and no links still
+    /// draws, and what it leaves out is counted rather than vanishing.
+    #[test]
+    fn a_plain_markdown_repo_draws_without_any_types() {
+        let l = base(&[
+            "README.md", "docs/one.md", "docs/two.MD", "notes/x.markdown",
+            "src/main.rs", "Cargo.toml", ".lex/COMPACT-ONTOLOGY.md",
+        ]);
+        assert_eq!(l.meta.view, View::Base);
+        assert_eq!(l.meta.node_count, 4);
+        assert_eq!(l.meta.other_files, 2);
+        assert_eq!(l.meta.machinery_files, 1);
+        assert_eq!(l.meta.undated, 0, "every file had a commit, so none belongs on the rim");
+        let names: Vec<&str> = l.meta.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["docs/", "notes/", "(top level)"]);
+        assert!(l.meta.docs.iter().all(|d| d.id.starts_with(FILE_PREFIX)));
+    }
+
+    /// A folder holding a large share of the repo is split, or the picture is
+    /// one colour. lUX is 94% `Copia/`; W3BL0RD is 51% `Soul/`.
+    #[test]
+    fn a_folder_holding_most_of_the_repo_is_split_one_level_down() {
+        let l = base(&[
+            "Soul/Journal/a.md", "Soul/Journal/b.md", "Soul/Note/c.md",
+            "Soul/Note/d.md", "Soul/e.md", "SOUL.md", "Harness/m.md",
+        ]);
+        let names: Vec<&str> = l.meta.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Soul/Journal/", "Soul/Note/", "Harness/", "Soul/", "(top level)"]);
+
+        // Just over a third splits; just under does not. 4 of 11 and 3 of 11.
+        let l = base(&[
+            "A/x/1.md", "A/x/2.md", "A/y/3.md", "A/y/4.md",
+            "B/x/5.md", "B/x/6.md", "B/y/7.md",
+            "C/8.md", "D/9.md", "E/10.md", "F/11.md",
+        ]);
+        let names: HashSet<&str> = l.meta.classes.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains("A/x/") && names.contains("A/y/"), "{names:?}");
+        assert!(names.contains("B/") && !names.contains("B/x/"), "{names:?}");
+    }
+
+    /// More folders than colours: the tail shares one grey entry instead of
+    /// two folders quietly sharing a hue.
+    #[test]
+    fn folders_past_the_palette_share_one_entry() {
+        let paths: Vec<String> = (0..15).map(|i| format!("f{i:02}/doc.md")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let l = base(&refs);
+        assert_eq!(l.meta.classes.len(), MAX_FOLDERS + 1);
+        let rest = l.meta.classes.last().unwrap();
+        assert_eq!((rest.name.as_str(), rest.count), ("(other folders)", 4));
+        let colours: HashSet<&str> =
+            l.meta.classes[..MAX_FOLDERS].iter().map(|c| c.color.as_str()).collect();
+        assert_eq!(colours.len(), MAX_FOLDERS, "two named folders share a colour");
     }
 }

@@ -13,6 +13,8 @@
     edgeSubset: Uint32Array | null
     selected: number | null
     view: 'spiral' | 'neighbourhood'
+    /** Why the reading on screen is not the one that was asked for. */
+    readingNote: string | null
     centreOn: number | null
     onselect: (i: number | null) => void
     onready: (r: GraphRenderer) => void
@@ -30,7 +32,7 @@
   }
   let {
     meta, buffer, states, track, positions, edgeSubset,
-    selected, view, centreOn, onselect, onready,
+    selected, view, readingNote, centreOn, onselect, onready,
     docOpen, docFile, docLoading, ondocclose, syncState, onsync,
   }: Props = $props()
 
@@ -323,7 +325,7 @@
     {#if err}
       <p class="err">{err}</p>
     {:else if !meta}
-      <p class="empty">choose a soul</p>
+      <p class="empty">choose a repo</p>
     {/if}
     <canvas
       bind:this={canvas}
@@ -350,8 +352,14 @@
     {/if}
   </div>
 
-  {#if meta && (meta.dropped.length || meta.undated)}
+  {#if meta && (meta.dropped.length || meta.undated || readingNote || meta.view === 'base')}
     <div class="disclose">
+      {#if readingNote}<span class="note">{readingNote}</span>{/if}
+      {#if meta.view === 'base'}
+        <span title="The base view draws markdown only. Files under .lex/ are git-lex's own machinery (kit copies, the compact ontology), not anybody's writing.">
+          not drawn: <b>{meta.other_files}</b> other files{#if meta.machinery_files}, <b>{meta.machinery_files}</b> under .lex/{/if}
+        </span>
+      {/if}
       {#if meta.undated}<span><b>{meta.undated}</b> undated, drawn on the rim</span>{/if}
       {#if meta.links_undated}
         <span title="The store records no commit for these links, so they cannot be placed on the replay timeline. They appear when the replay finishes.">
@@ -435,6 +443,7 @@
   }
   .disclose b { color: var(--ink-soft); }
   .pred { color: var(--ink-faint); }
+  .disclose .note { color: var(--warn); }
 
   .empty, .err {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;

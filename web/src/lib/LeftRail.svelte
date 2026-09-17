@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { RepoProbe, ServerStatus, SyncState } from './types'
-  import type { LayoutMeta } from './graph'
+  import type { LayoutMeta, Reading } from './graph'
   import { kitLabel, ago } from './format'
 
   interface Props {
@@ -13,6 +13,8 @@
     search: string
     matchCount: number
     view: 'spiral' | 'neighbourhood'
+    reading: Reading
+    onreading: (r: Reading) => void
     hasSelection: boolean
     onpick: (r: RepoProbe) => void
     syncs: Record<string, SyncState>
@@ -29,7 +31,7 @@
   }
   let {
     repos, servers, current, busy, meta, syncs, onsync, visibleClasses, search, matchCount,
-    view, hasSelection, onpick, ontoggle, onlyclass, onallclasses, onsearch, onview,
+    view, reading, onreading, hasSelection, onpick, ontoggle, onlyclass, onallclasses, onsearch, onview,
     visiblePredicates, ontogglepredicate, onlypredicate, onallpredicates,
   }: Props = $props()
 
@@ -174,8 +176,25 @@
 
   <section class="block">
     <h2>view</h2>
+    <!-- What is drawn. Base works for every repo; types needs a kit to have
+         typed something, and the page falls back to base when it has not. -->
     <div class="views">
-      <button class:on={view === 'spiral'} onclick={() => onview('spiral')}>whole soul</button>
+      <button
+        class:on={reading === 'base'}
+        disabled={!meta}
+        title="every markdown file, coloured by folder, placed by the commit git says it first appeared in — works for any repo"
+        onclick={() => onreading('base')}
+      >base</button>
+      <button
+        class:on={reading === 'typed'}
+        disabled={!meta}
+        title="documents the kit has given a type, coloured by that type"
+        onclick={() => onreading('typed')}
+      >types</button>
+    </div>
+    <!-- How it is laid out. -->
+    <div class="views">
+      <button class:on={view === 'spiral'} onclick={() => onview('spiral')}>whole repo</button>
       <button
         class:on={view === 'neighbourhood'}
         disabled={!hasSelection}
@@ -204,7 +223,7 @@
 
   <section class="block grow">
     <h2>
-      classes
+      {meta?.view === 'base' ? 'folders' : 'types'}
       {#if meta}<span class="n">{meta.classes.length}</span>{/if}
       <button class="all" onclick={onallclasses}>all</button>
     </h2>
@@ -222,12 +241,12 @@
               <span class="cname">{c.name}</span>
               <span class="ccount">{c.count}</span>
             </button>
-            <button class="only" onclick={() => onlyclass(i)} title="show only this class">only</button>
+            <button class="only" onclick={() => onlyclass(i)} title={meta.view === 'base' ? 'show only this folder' : 'show only this type'}>only</button>
           </li>
         {/each}
       </ul>
     {:else}
-      <p class="foot">no soul open</p>
+      <p class="foot">no repo open</p>
     {/if}
   </section>
 
@@ -359,6 +378,7 @@
   .repo.active .rstale { color: rgba(255,255,255,0.75); }
 
   .views { display: flex; gap: 0.3rem; }
+  .views + .views { margin-top: 0.3rem; }
   .views button { flex: 1; font-size: 11px; padding: 0.2rem 0.3rem; border: 1px solid var(--rule); }
   .views button.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 

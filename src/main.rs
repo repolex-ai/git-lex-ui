@@ -472,20 +472,50 @@ async fn layout_target(
     Ok((probe, port))
 }
 
+#[derive(Deserialize)]
+struct ViewQuery {
+    #[serde(default)]
+    view: Option<String>,
+}
+
+/// `?view=base` or `?view=typed`; typed when absent, which is what every
+/// link made before the base view existed meant. An unknown value is an
+/// error rather than a quiet default — a misspelt view drawing the other one
+/// would look like a correct answer.
+fn view_of(q: &ViewQuery) -> Result<layout::View, Response> {
+    match q.view.as_deref() {
+        None => Ok(layout::View::Typed),
+        Some(v) => layout::View::parse(v).ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, format!("unknown view `{v}` — use base or typed")).into_response()
+        }),
+    }
+}
+
+/// In-memory payloads are held per repo AND per view.
+fn layout_key(genesis: &str, view: layout::View) -> String {
+    format!("{genesis}:{}", view.as_str())
+}
+
 /// Build (or reuse) the layout and return its metadata. The binary payload
 /// comes from the companion `/data` route.
 async fn api_layout_meta(
     State(s): State<Arc<AppState>>,
     AxPath(genesis): AxPath<String>,
+    axum::extract::Query(q): axum::extract::Query<ViewQuery>,
 ) -> Response {
+    let view = match view_of(&q) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let (probe, port) = match layout_target(&s, &genesis).await {
         Ok(v) => v,
         Err((c, m)) => return (c, m).into_response(),
     };
     let head = probe.head_sha.clone().unwrap_or_default();
+    let key = layout_key(&genesis, view);
 
-    if let Some(c) = layout_api::load(&s.cache_dir, &genesis, &head) {
-        s.layouts.write().await.insert(genesis.clone(), Arc::new(c.data));
+    if let Some(c) = layout_api::load(&s.cache_dir, &genesis, &head, view) {
+        s.layouts.write().await.insert(key, Arc::new(c.data));
         return (
             [
                 (axum::http::header::CONTENT_TYPE, "application/json"),
@@ -505,6 +535,7 @@ async fn api_layout_meta(
         &genesis,
         &head,
         std::path::Path::new(&probe.path),
+        view,
     )
     .await
     {
@@ -516,7 +547,7 @@ async fn api_layout_meta(
         // A cache we could not write is a slow path, not a failure.
         Err(_) => serde_json::to_string(&built.meta).unwrap_or_default(),
     };
-    s.layouts.write().await.insert(genesis.clone(), Arc::new(built.data));
+    s.layouts.write().await.insert(key, Arc::new(built.data));
     (
         [
             (axum::http::header::CONTENT_TYPE, "application/json"),
@@ -532,8 +563,13 @@ async fn api_layout_meta(
 async fn api_layout_data(
     State(s): State<Arc<AppState>>,
     AxPath(genesis): AxPath<String>,
+    axum::extract::Query(q): axum::extract::Query<ViewQuery>,
 ) -> Response {
-    if let Some(d) = s.layouts.read().await.get(&genesis).cloned() {
+    let view = match view_of(&q) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Some(d) = s.layouts.read().await.get(&layout_key(&genesis, view)).cloned() {
         return (
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
             (*d).clone(),
@@ -881,7 +917,9 @@ async fn api_sync_start(
                     }
                 }
             }
-            st.layouts.write().await.remove(&g);
+            let mut held = st.layouts.write().await;
+            held.remove(&layout_key(&g, layout::View::Base));
+            held.remove(&layout_key(&g, layout::View::Typed));
         }
     });
 
