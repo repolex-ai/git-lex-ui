@@ -831,13 +831,21 @@ async fn api_sync_start(
         let next = match out {
             Ok(o) if o.status.success() => {
                 let text = String::from_utf8_lossy(&o.stdout);
-                // git-lex's own closing line, so the figures are its own.
+                // git-lex's own result line, so the figures are its own.
+                //
+                // Not simply the LAST line. The first version took that, and
+                // on a real sync the last line was housekeeping ("Agent
+                // context: .lex/COMPACT-ONTOLOGY.md updated") — a confident,
+                // well-formed summary of something other than the sync. The
+                // result line starts with "Synced in" or "Already synced";
+                // take it, and fall back to the last line only if git-lex
+                // ever stops printing one.
                 let summary = text
                     .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
+                    .map(str::trim)
+                    .find(|l| l.starts_with("Synced in") || l.starts_with("Already synced"))
+                    .or_else(|| text.lines().rev().map(str::trim).find(|l| !l.is_empty()))
                     .unwrap_or("synced")
-                    .trim()
                     .to_string();
                 SyncState::Done { ms, summary }
             }
