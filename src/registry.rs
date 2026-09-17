@@ -1,6 +1,6 @@
 //! The machine registry of known git-lex repos.
 //!
-//! Lives at `~/.lex/repos.*`. Rob ruled 2026-09-01: do not hard-code the
+//! Lives at `~/.lex/repos.*`. Ruled by @goodlux 2026-09-01: do not hard-code the
 //! extension — look in the directory and sniff whatever is there. Today it is
 //! `repos.json` and the brief said YAML, which is exactly why we sniff.
 //!
@@ -228,7 +228,7 @@ pub struct PruneReport {
 
 /// Remove the dead entries from the registry file.
 ///
-/// Rob ruled: prune the file, keep a record. Two things make this safe to do
+/// Ruled by @goodlux 2026-09-01: prune the file, keep a record. Two things make this safe to do
 /// to a file we do not own.
 ///
 /// **We re-read at write time and remove only what we condemned.** The

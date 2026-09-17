@@ -393,7 +393,7 @@ export class GraphRenderer {
    *  zoom level shared by a 51-document soul and a 7,651-document one — the
    *  small one opens as a dot in the middle of an empty stage, the large one
    *  overflows, and in both cases the first thing you do is fight the view
-   *  before you can read anything. Rob called it out as the panning and
+   *  before you can read anything. Called out by @goodlux as the panning and
    *  zooming not feeling right; the panning was fine, it was starting in the
    *  wrong place.
    *

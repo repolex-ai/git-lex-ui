@@ -2,7 +2,7 @@
   import { GraphRenderer, NodeState, type View } from './renderer'
   import type { LayoutMeta, DocMeta } from './graph'
   import DocPanel from './DocPanel.svelte'
-  import type { FileText } from './types'
+  import type { FileText, SyncState } from './types'
 
   interface Props {
     meta: LayoutMeta | null
@@ -20,6 +20,9 @@
      *  rather than by the app shell — `.canvas-wrap` is the positioned
      *  ancestor it anchors to, and a sibling of the stage would have become
      *  a fourth column in the app's three-column grid. */
+    /** Sync state for the open soul, and how to start one. */
+    syncState: SyncState | null
+    onsync: () => void
     docOpen: boolean
     docFile: FileText | null
     docLoading: boolean
@@ -28,7 +31,7 @@
   let {
     meta, buffer, states, track, positions, edgeSubset,
     selected, view, centreOn, onselect, onready,
-    docOpen, docFile, docLoading, ondocclose,
+    docOpen, docFile, docLoading, ondocclose, syncState, onsync,
   }: Props = $props()
 
   let canvas = $state<HTMLCanvasElement | null>(null)
@@ -239,8 +242,9 @@
   //
   // The layout already fits the window, and at that scale the whole soul is
   // legible without moving anything — so pan and zoom were two ways to leave
-  // a good view and no way to get back to it except a button. Rob: "I don't
-  // really need to zoom." Removing them also removes every bug they carried:
+  // a good view and no way to get back to it except a button; @goodlux
+  // confirmed zoom was not wanted here. Removing them also removes every bug
+  // they carried:
   // the drag-that-is-really-a-click, the pick radius that had to be divided
   // by the current scale, and a camera that could be left somewhere the
   // reset button was the only escape from.
@@ -294,28 +298,26 @@
         <span class="playhead">commit {playhead} of {LAST}</span>
       {/if}
     {/if}
+    <!-- The store is built by `git lex sync`, not `git lex save`, so a soul
+         can be ahead of the graph drawn from it while every number on screen
+         stays internally consistent. That fact used to be a full-width banner;
+         it is now a note with its fix beside it, since a problem you have to
+         go elsewhere to solve is a label with no action attached. -->
+    {#if meta && meta.store_head && meta.store_head !== meta.head_sha}
+      <span
+        class="behind"
+        title="this graph was built from commit {meta.store_head.slice(0, 8)}; the repo is at {meta.head_sha.slice(0, 8)}. Saving does not rebuild the graph — syncing does."
+      >
+        {meta.commits_behind === null ? 'behind' : `${meta.commits_behind} behind`}
+      </span>
+      <button
+        class="play"
+        disabled={syncState?.state === 'running'}
+        onclick={onsync}
+      >{syncState?.state === 'running' ? 'syncing\u2026' : 'sync'}</button>
+    {/if}
     <label><input type="checkbox" bind:checked={showEdges} onchange={invalidate} /> edges</label>
   </div>
-
-  <!-- The store is built by `git lex sync`, not by `git lex save`. A soul can
-       be several documents ahead of the graph drawn from it, and every number
-       on screen will be internally consistent and wrong about today. That is
-       the one thing this view must never let pass quietly, so it sits above
-       the graph rather than in a footer. -->
-  {#if meta && meta.store_head && meta.store_head !== meta.head_sha}
-    <div class="stale">
-      <b>This graph is behind the repo.</b>
-      The store was last built from commit <code>{meta.store_head.slice(0, 8)}</code>;
-      the repo is at <code>{meta.head_sha.slice(0, 8)}</code>
-      {#if meta.commits_behind !== null}
-        — <b>{meta.commits_behind}</b>
-        {meta.commits_behind === 1 ? 'commit' : 'commits'} not in this picture.
-      {:else}
-        — by an unknown number of commits.
-      {/if}
-      Run <code>git lex sync</code> in the repo, then reload.
-    </div>
-  {/if}
 
   <div class="canvas-wrap">
     {#if err}
@@ -393,16 +395,6 @@
   .bar label { display: flex; align-items: center; gap: 0.25rem; }
   .bar button { font-size: 11px; padding: 0.1rem 0.45rem; }
 
-  .stale {
-    flex: none;
-    background: #fff8e6;
-    border-bottom: 1px solid #e8d9a8;
-    color: var(--warn);
-    padding: 0.35rem 0.7rem;
-    font-size: 11px;
-  }
-  .stale b { color: var(--ink); }
-  .stale code { font-size: 10px; }
 
   .play {
     font-size: 11px;
@@ -412,6 +404,11 @@
     cursor: pointer;
   }
   .play:hover { border-color: var(--ink); }
+  .behind {
+    font-size: 10px;
+    color: var(--warn);
+    font-variant-numeric: tabular-nums;
+  }
   .playhead {
     font-size: 10px;
     color: var(--ink-faint);

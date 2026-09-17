@@ -29,7 +29,18 @@ export type GraphFreshness =
   | { state: 'current'; sha: string }
   | { state: 'behind'; sha: string; commits: number | null }
   | { state: 'unplaceable' }
+  /** The store was written after the spine that claims to describe it — so
+   *  the spine's position is a claim about a store that no longer exists, and
+   *  the last sync did not finish. No number is offered, because any number
+   *  here would be confidently wrong. */
+  | { state: 'spine-stale'; spine_sha: string }
   | { state: 'never-synced' }
+
+/** What `git lex sync` is doing for one repo. */
+export type SyncState =
+  | { state: 'running'; started_ms: number }
+  | { state: 'done'; ms: number; summary: string }
+  | { state: 'failed'; ms: number; message: string }
 
 export type RepoFamily =
   | { family: 'soul' }

@@ -135,7 +135,7 @@ pub fn q_nodes() -> String {
 /// Worth recording how nearly this was not built: the first version of this
 /// query named the wrong graph and returned zero rows, which reads exactly
 /// like "the store does not have this" — the answer that would have had me
-/// tell Rob it was not possible. The control (count reified statements at
+/// report it as not possible. The control (count reified statements at
 /// all) is what separated a wrong query from a real absence. See
 /// `feedback-a-label-is-a-claim-with-no-test`.
 pub fn q_link_born() -> String {
@@ -727,7 +727,7 @@ pub fn build(
 
         // Size is how many times the document changed, compressed so a
         // 300-event document does not swallow its neighbours.
-        // Halved from 3.2 on 2026-09-04 — Rob asked for smaller dots, and at
+        // Halved from 3.2 on 2026-09-04 at @goodlux's request, and at
         // a view that now fits the window they were reading as blobs rather
         // than as points on a track. See LAYOUT_VERSION in layout_api.rs:
         // the cache is keyed by HEAD, which cannot see a change to this line.

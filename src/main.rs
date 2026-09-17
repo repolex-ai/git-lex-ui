@@ -77,6 +77,8 @@ struct AppState {
     cache_dir: PathBuf,
     /// Packed layout payloads, by genesis sha, for the companion data route.
     layouts: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    /// What `git lex sync` is doing, per repo path. See `SyncState`.
+    syncs: RwLock<HashMap<String, SyncState>>,
     registry_path: RwLock<Option<String>>,
     registry_format: RwLock<Option<String>>,
     started_ms: u128,
@@ -125,6 +127,7 @@ async fn main() {
         lex_dir: lex_dir.clone(),
         cache_dir: cache_dir.clone(),
         layouts: RwLock::new(HashMap::new()),
+        syncs: RwLock::new(HashMap::new()),
         registry_path: RwLock::new(None),
         registry_format: RwLock::new(None),
         started_ms: now_ms(),
@@ -157,6 +160,7 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/layout/{genesis}", get(api_layout_meta))
         .route("/api/layout/{genesis}/data", get(api_layout_data))
+        .route("/api/sync", get(api_sync_status).post(api_sync_start))
         .route("/api/file/{genesis}", get(api_file))
         .route("/r/{genesis}/sparql", get(proxy_sparql).post(proxy_sparql))
         .route("/{*asset}", get(static_asset))
@@ -678,7 +682,7 @@ async fn static_asset(State(s): State<Arc<AppState>>, AxPath(asset): AxPath<Stri
 
 /// The text of one document, read straight off disk.
 ///
-/// Rob asked for the old viewer's behaviour: click a dot, see the actual
+/// Requested by @goodlux: the old viewer's behaviour, click a dot and see
 /// file. That is a filesystem read, not a graph query — the store holds the
 /// document's *facts*, never its prose, so no amount of SPARQL returns the
 /// words. This front door already knows every repo's absolute path, so it can
@@ -748,4 +752,130 @@ async fn api_file(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+
+// --- running `git lex sync` from the front door ---------------------------
+//
+// The only write this tool performs, and it is deliberately the narrowest one
+// possible: it rebuilds a DERIVED store from commits that already exist. It
+// creates no commits, changes no tracked file, and loses nothing that is not
+// regenerable from git.
+//
+// It earns its place because "13 of 15 graphs are behind" was true for two
+// weeks and the answer was always the same command in a different directory.
+// A banner that states a problem you have to go elsewhere to fix is a label
+// with no action attached — it was replaced by this.
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+enum SyncState {
+    Running { started_ms: u128 },
+    /// Finished cleanly. `summary` is git-lex's own last line, so the number
+    /// shown is the tool's, not ours.
+    Done { ms: u128, summary: String },
+    /// Finished badly. The message is kept verbatim: a sync failure is
+    /// usually a real fact about the repo and paraphrasing it loses the fix.
+    Failed { ms: u128, message: String },
+}
+
+async fn api_sync_status(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    axum::Json(s.syncs.read().await.clone())
+}
+
+#[derive(serde::Deserialize)]
+struct SyncRequest {
+    path: String,
+}
+
+async fn api_sync_start(
+    State(s): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<SyncRequest>,
+) -> Response {
+    // Only repos this front door already knows about. The path arrives from
+    // the browser, and `git lex sync` in an arbitrary directory is not
+    // something a page should be able to ask for.
+    let known = s
+        .repos
+        .read()
+        .await
+        .iter()
+        .any(|r| r.path == body.path);
+    if !known {
+        return (StatusCode::NOT_FOUND, "no such repo in the registry").into_response();
+    }
+
+    {
+        let syncs = s.syncs.read().await;
+        if matches!(syncs.get(&body.path), Some(SyncState::Running { .. })) {
+            return (StatusCode::CONFLICT, "already syncing").into_response();
+        }
+    }
+
+    let started = now_ms();
+    s.syncs
+        .write()
+        .await
+        .insert(body.path.clone(), SyncState::Running { started_ms: started });
+
+    let st = s.clone();
+    let path = body.path.clone();
+    tokio::spawn(async move {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["lex", "sync"])
+            .output()
+            .await;
+        let ms = now_ms().saturating_sub(started);
+        let next = match out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                // git-lex's own closing line, so the figures are its own.
+                let summary = text
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("synced")
+                    .trim()
+                    .to_string();
+                SyncState::Done { ms, summary }
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let msg = if err.trim().is_empty() {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                } else {
+                    err.trim().to_string()
+                };
+                SyncState::Failed { ms, message: msg }
+            }
+            Err(e) => SyncState::Failed { ms, message: e.to_string() },
+        };
+        st.syncs.write().await.insert(path.clone(), next);
+
+        // Drop this repo's cached layouts. They were built from the old
+        // store, and a cache keyed by HEAD cannot see that the store beneath
+        // it changed — the same blindness that made LAYOUT_VERSION necessary.
+        if let Some(g) = st
+            .repos
+            .read()
+            .await
+            .iter()
+            .find(|r| r.path == path)
+            .and_then(|r| r.genesis_sha.clone())
+        {
+            let dir = st.cache_dir.join(&g);
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with("layout-") {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            st.layouts.write().await.remove(&g);
+        }
+    });
+
+    (StatusCode::ACCEPTED, axum::Json(SyncState::Running { started_ms: started })).into_response()
 }

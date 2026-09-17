@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RepoProbe, ServerStatus } from './types'
+  import type { RepoProbe, ServerStatus, SyncState } from './types'
   import type { LayoutMeta } from './graph'
   import { kitLabel, ago } from './format'
 
@@ -15,6 +15,8 @@
     view: 'spiral' | 'neighbourhood'
     hasSelection: boolean
     onpick: (r: RepoProbe) => void
+    syncs: Record<string, SyncState>
+    onsync: (r: RepoProbe) => void
     ontoggle: (i: number) => void
     onlyclass: (i: number) => void
     onallclasses: () => void
@@ -26,7 +28,7 @@
     onallpredicates: () => void
   }
   let {
-    repos, servers, current, busy, meta, visibleClasses, search, matchCount,
+    repos, servers, current, busy, meta, syncs, onsync, visibleClasses, search, matchCount,
     view, hasSelection, onpick, ontoggle, onlyclass, onallclasses, onsearch, onview,
     visiblePredicates, ontogglepredicate, onlypredicate, onallpredicates,
   }: Props = $props()
@@ -59,6 +61,13 @@
               : `the graph is ${n} commit${n === 1 ? '' : 's'} behind this repo. It was built at ${g.sha.slice(0, 8)}. Saving does not advance it; only \u2018git lex sync\u2019 does.`,
         }
       }
+      case 'spine-stale':
+        return {
+          mark: '\u26a0',
+          cls: 'behind',
+          title:
+            `the last sync did not finish: this store was written AFTER the marker file that records its position (${g.spine_sha.slice(0, 8)}), so how far behind it is cannot be read, and it may be missing the view the graph is drawn from. Sync it.`,
+        }
       case 'unplaceable':
         return {
           mark: '\u25cb',
@@ -75,16 +84,6 @@
     }
   }
 
-  /** How many rows we can actually place, and how many of those are behind.
-   *  Stated as "N of M" rather than a bare N, because the denominator is the
-   *  part that says whether the number is worrying. */
-  let placeable = $derived(
-    repos.filter((r) => r.graph && (r.graph.state === 'current' || r.graph.state === 'behind')).length,
-  )
-  let behindCount = $derived(repos.filter((r) => r.graph?.state === 'behind').length)
-  let behindCommits = $derived(
-    repos.reduce((a, r) => a + (r.graph?.state === 'behind' ? (r.graph.commits ?? 0) : 0), 0),
-  )
 
   /** The list, split by what kind of repo each row is.
    *
@@ -104,6 +103,14 @@
       rows: repos.filter((r) => (r.family?.family ?? 'plain') === g.key),
     })).filter((g) => g.rows.length > 0),
   )
+
+  /** Whether this row should offer a sync. Everything except a graph that is
+   *  demonstrably current — including the states where we cannot tell, since
+   *  "I cannot answer that" is a reason to offer the fix, not to withhold it. */
+  function needsSync(r: RepoProbe): boolean {
+    const st = r.graph?.state
+    return st === 'behind' || st === 'spine-stale' || st === 'unplaceable'
+  }
 
   function dot(r: RepoProbe): string {
     const s = servers[r.path]
@@ -143,16 +150,26 @@
               {ago(r.recency)}{r.recency_source === 'head-commit' ? '*' : ''}
             </span>
           </button>
+          {#if needsSync(r)}
+            {@const sy = syncs[r.path]}
+            <button
+              class="sync"
+              class:running={sy?.state === 'running'}
+              class:failed={sy?.state === 'failed'}
+              disabled={sy?.state === 'running'}
+              title={sy?.state === 'running'
+                ? 'rebuilding the graph from this repo — lUX takes about three and a half minutes'
+                : sy?.state === 'failed'
+                  ? `last sync failed: ${sy.message}`
+                  : 'run `git lex sync` here — rebuilds the graph from commits that already exist, writes no commit of its own'}
+              onclick={() => onsync(r)}
+            >{sy?.state === 'running' ? '\u2026' : sy?.state === 'failed' ? 'retry' : 'sync'}</button>
+          {/if}
         </li>
       {/each}
       {/each}
     </ul>
     <p class="foot">* ordered by last commit — the registry had no record of it being opened</p>
-    {#if behindCount > 0}
-      <p class="foot warn" title="git lex save commits your work; it does not rebuild the graph. Only git lex sync does. Read from each repo's spine filename, which is named for the commit it was built at.">
-        &#8634; {behindCount} of {placeable} graphs are behind their repo — {behindCommits} commits unindexed. Run <code>git lex sync</code> in each.
-      </p>
-    {/if}
   </section>
 
   <section class="block">
@@ -323,6 +340,22 @@
   .rstale { grid-area: g; font-size: 10px; font-variant-numeric: tabular-nums; justify-self: end; }
   .rstale.behind { color: var(--warn); }
   .rstale.unknown { color: var(--ink-faint); }
+
+  /* The row's action. Sits beside the row rather than inside it — a button
+     nested in a button is invalid markup and the inner click never arrives.
+     Quiet until hovered: most rows on this machine carry one. */
+  .repos li { position: relative; }
+  .sync {
+    position: absolute; right: 0.3rem; bottom: 0.3rem;
+    font-size: 9px; line-height: 1; padding: 0.15rem 0.35rem;
+    border: 1px solid var(--rule); background: var(--paper);
+    color: var(--ink-faint); cursor: pointer;
+  }
+  .sync:hover:not(:disabled) { border-color: var(--ink); color: var(--ink); }
+  .sync.running { color: var(--warn); border-color: var(--warn); cursor: progress; }
+  .sync.failed { color: var(--dead); border-color: var(--dead); }
+  /* make room so the marker and the button never overlap */
+  .repos li:has(.sync) .rstale { margin-right: 2.6rem; }
   .repo.active .rstale { color: rgba(255,255,255,0.75); }
 
   .views { display: flex; gap: 0.3rem; }
@@ -358,6 +391,4 @@
 
   .foot { font-size: 10px; color: var(--ink-faint); margin: 0.35rem 0 0; }
   .foot.none { color: var(--warn); }
-  .foot.warn { color: var(--warn); }
-  .foot code { font-family: var(--mono); font-size: 10px; }
 </style>

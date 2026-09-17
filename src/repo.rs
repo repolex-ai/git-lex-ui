@@ -57,7 +57,7 @@ pub enum RecencySource {
 /// **git-lex's base case is a plain repository of markdown files.** The soul
 /// kit is one thing you can install on top; it is not what git-lex is. This
 /// front door was written against a machine holding 20 souls and had quietly
-/// started treating "repo" and "soul" as the same word — Rob caught it and
+/// started treating "repo" and "soul" as the same word. Caught by @goodlux
 /// asked for the list to be segmented, which is right, and cheap, and stops
 /// the assumption spreading further into the UI.
 ///
@@ -148,6 +148,22 @@ pub enum GraphFreshness {
     /// A store exists but no spine names its position. Cannot be placed from
     /// the filesystem alone; ask the running server for its newest commit.
     Unplaceable,
+    /// **The store was written AFTER the spine that claims to describe it.**
+    ///
+    /// The spine is a position marker, not the position — and the two can
+    /// disagree. Found on lUX 2026-09-16: its spine said 15 commits behind,
+    /// its store had actually been rebuilt three days later to 8 behind, and
+    /// the rebuild had never produced a `now` view at all, so the soul could
+    /// not be drawn. A sync had been interrupted between writing the big
+    /// graphs and finishing the job.
+    ///
+    /// A number here would have been wrong in both directions at once:
+    /// pessimistic about the distance, and silent about the only fact that
+    /// mattered. So this reports the disagreement instead of a figure.
+    SpineStale {
+        /// What the spine claims, kept because it is still a clue.
+        spine_sha: String,
+    },
     /// No store at all. This repo has never been synced.
     NeverSynced,
 }
@@ -238,13 +254,42 @@ async fn graph_freshness(path: &Path, head: Option<&str>) -> GraphFreshness {
     }
     spines.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let Some((_, sha)) = spines.into_iter().next() else {
+    let Some((spine_time, sha)) = spines.into_iter().next() else {
         return if store.is_dir() {
             GraphFreshness::Unplaceable
         } else {
             GraphFreshness::NeverSynced
         };
     };
+
+    // Does the spine actually describe THIS store? `git lex sync` writes the
+    // store and then the spine, so store DATA written after the spine means
+    // the spine's position is a claim about a store that has since changed.
+    //
+    // Compared against the newest `.sst` — the database's data files — and
+    // NOT the store directory's own timestamp. The first version used the
+    // directory, and it flagged four souls on 2026-09-17, two of them
+    // falsely: the database rewrites its MANIFEST, OPTIONS and LOG on every
+    // OPEN, so any read — including this front door serving the graph —
+    // bumped the directory without changing a single fact. On 4RX the
+    // directory was 12.5 hours newer than the spine and the newest data file
+    // was the same second. A detector that fires because it was looked at
+    // is the flinch test failing on the instrument itself.
+    //
+    // A minute of slack: the two writes are seconds apart in a healthy sync.
+    let newest_data = std::fs::read_dir(&store).ok().and_then(|rd| {
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".sst"))
+            .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+            .max()
+    });
+    if let Some(data_time) = newest_data {
+        if let Ok(gap) = data_time.duration_since(spine_time) {
+            if gap.as_secs() > 60 {
+                return GraphFreshness::SpineStale { spine_sha: sha };
+            }
+        }
+    }
 
     match head {
         Some(h) if h == sha => GraphFreshness::Current { sha },
@@ -431,7 +476,7 @@ mod tests {
 
     /// The base case must survive a machine that is 20/24 souls.
     ///
-    /// This is the assumption Rob caught: a front door written here starts
+    /// The assumption @goodlux caught (2026-09-03): a front door written here
     /// treating "repo" and "soul" as synonyms, because on this machine they
     /// almost are. A plain markdown repo has to classify as plain even
     /// though nothing on this laptop looks like one except git-lex itself.
@@ -459,6 +504,75 @@ mod tests {
         // Evidence on disk outweighs a missing declaration.
         std::fs::create_dir_all(tmp.join("Soul")).unwrap();
         assert_eq!(RepoFamily::classify(None, &tmp), RepoFamily::Soul);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A spine older than its store must not report a position.
+    ///
+    /// This is lUX on 2026-09-16: the spine said 15 behind, the store had been
+    /// rewritten three days later by a sync that never finished, and the soul
+    /// could not be drawn at all. The spine's number was a claim about a store
+    /// that no longer existed. The honest answer is the disagreement itself.
+    #[tokio::test]
+    async fn a_store_rewritten_after_its_spine_is_not_given_a_number() {
+        let tmp = std::env::temp_dir().join(format!("glui-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let head = repo(&tmp);
+        let store = tmp.join(".lex/_ignore/oxigraph");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("000001.sst"), "data").unwrap();
+        // An open-only file, rewritten on every read. Must NOT count.
+        std::fs::write(store.join("MANIFEST-000001"), "m").unwrap();
+
+        // Spine written, then the store's DATA touched well after it.
+        spine(&tmp, &head);
+        let spine_file = tmp.join(format!(".lex/_ignore/spine/{head}.spine.tsv"));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(&spine_file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        match graph_freshness(&tmp, Some(&head)).await {
+            GraphFreshness::SpineStale { spine_sha } => assert_eq!(spine_sha, head),
+            other => panic!(
+                "a spine three days older than its store must not be trusted, got {other:?} \
+                 — note it would otherwise have read as CURRENT, since the spine names HEAD"
+            ),
+        }
+
+        // A read bumps only the open-time files. With data older than the
+        // spine, that must not fire — this is the false alarm the directory
+        // timestamp raised on 4RX and TR1P.L3X.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let spine_newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&spine_file).unwrap()
+            .set_modified(spine_newer).unwrap();
+        std::fs::File::options().write(true).open(store.join("000001.sst")).unwrap()
+            .set_modified(std::time::SystemTime::now()).unwrap();
+        std::fs::File::options().write(true).open(store.join("MANIFEST-000001")).unwrap()
+            .set_modified(later).unwrap();
+        assert!(
+            matches!(graph_freshness(&tmp, Some(&head)).await, GraphFreshness::Current { .. }),
+            "opening the store must not make it look stale"
+        );
+
+        // And a spine written just after its store is still believed: the
+        // check must not fire on a healthy sync.
+        std::fs::File::options()
+            .write(true)
+            .open(&spine_file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            graph_freshness(&tmp, Some(&head)).await,
+            GraphFreshness::Current { .. }
+        ));
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

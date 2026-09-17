@@ -1,4 +1,4 @@
-import type { ReposResponse, ServerStatus, FileText } from './types'
+import type { ReposResponse, ServerStatus, FileText, SyncState } from './types'
 
 async function json<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error((await r.text()) || `${r.status} ${r.statusText}`)
@@ -9,6 +9,18 @@ export const api = {
   repos: () => fetch('/api/repos').then(json<ReposResponse>),
 
   servers: () => fetch('/api/servers').then(json<ServerStatus[]>),
+
+  /** What every in-flight or finished sync is doing, keyed by repo path. */
+  syncs: () => fetch('/api/sync').then(json<Record<string, SyncState>>),
+
+  /** Start `git lex sync` in one repo. Returns as soon as it has started —
+   *  lUX takes three and a half minutes — so the caller polls `syncs()`. */
+  sync: (path: string) =>
+    fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }).then(json<SyncState>),
 
   /** The text of one document, read off disk.
    *

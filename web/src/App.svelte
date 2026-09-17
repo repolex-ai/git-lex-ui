@@ -9,7 +9,7 @@
   import LeftRail from './lib/LeftRail.svelte'
   import Stage from './lib/Stage.svelte'
   import Inspector from './lib/Inspector.svelte'
-  import type { FileText } from './lib/types'
+  import type { FileText, SyncState } from './lib/types'
 
   let data = $state<ReposResponse | null>(null)
   let servers = $state<Record<string, ServerStatus>>({})
@@ -30,7 +30,7 @@
 
   // --- the document panel -------------------------------------------------
   //
-  // Floats over the stage rather than living in the inspector: Rob asked for
+  // Floats over the stage rather than living in the inspector, matching
   // the old viewer's behaviour, where a document is something you open on top
   // of the graph and dismiss, not a section competing with the triples for
   // room in a 18rem rail.
@@ -92,11 +92,53 @@
     } catch { /* the next tick will say so */ }
   }
 
+  // --- sync ---------------------------------------------------------------
+  let syncs = $state<Record<string, SyncState>>({})
+  let syncTimer: ReturnType<typeof setInterval> | null = null
+
+  async function pollSyncs() {
+    try {
+      const next = await api.syncs()
+      // A sync that just finished changes what the list and the open graph
+      // should say, so refresh both when any running entry stops running.
+      const finished = Object.entries(syncs).filter(
+        ([p, st]) => st.state === 'running' && next[p] && next[p].state !== 'running',
+      )
+      syncs = next
+      if (finished.length) {
+        await loadRepos()
+        const open = current
+        if (open && finished.some(([p]) => p === open.path)) await openRepo(open)
+      }
+      if (!Object.values(next).some((st) => st.state === 'running') && syncTimer) {
+        clearInterval(syncTimer)
+        syncTimer = null
+      }
+    } catch { /* the next tick will say so */ }
+  }
+
+  async function startSync(repo: RepoProbe) {
+    try {
+      const st = await api.sync(repo.path)
+      syncs = { ...syncs, [repo.path]: st }
+      if (!syncTimer) syncTimer = setInterval(pollSyncs, 2000)
+    } catch (e) {
+      syncs = {
+        ...syncs,
+        [repo.path]: { state: 'failed', ms: 0, message: e instanceof Error ? e.message : String(e) },
+      }
+    }
+  }
+
   $effect(() => {
     loadRepos()
     pollServers()
+    pollSyncs()
     const t = setInterval(pollServers, 5000)
-    return () => clearInterval(t)
+    return () => {
+      clearInterval(t)
+      if (syncTimer) clearInterval(syncTimer)
+    }
   })
 
   async function openRepo(repo: RepoProbe) {
@@ -314,6 +356,8 @@
     {view}
     hasSelection={selected !== null}
     onpick={openRepo}
+    {syncs}
+    onsync={startSync}
     ontoggle={toggleClass}
     onlyclass={onlyClass}
     onallclasses={allClasses}
@@ -341,6 +385,8 @@
     {docFile}
     {docLoading}
     ondocclose={() => (docOpen = false)}
+    syncState={current ? (syncs[current.path] ?? null) : null}
+    onsync={() => current && startSync(current)}
   />
 
   <Inspector

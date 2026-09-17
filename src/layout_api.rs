@@ -119,8 +119,24 @@ pub async fn build_from_server(
         None => None,
     };
 
-    let (qn, qe, qa, qb, qd, ql, qlb) = (
-        layout::q_nodes(),
+    // Ask for documents FIRST, alone, and stop if there are none.
+    //
+    // These seven queries used to fan out together and the empty-store check
+    // ran after all of them had returned. On lUX — 1.5 million facts, and a
+    // store whose `now` view an interrupted sync had never created — that
+    // meant 26 seconds of work before reporting a problem the first query
+    // already knew about, on every single load, with nothing cacheable at the
+    // end of it. The cost of asking first is one extra round trip on the
+    // healthy path; the saving is everything on the broken one.
+    let nodes = c.query::<layout::NodeRow>(&layout::q_nodes()).await?;
+    if nodes.is_empty() {
+        return Err(
+            "this store has no documents in its `now` view — run `git lex sync` in the repo"
+                .to_string(),
+        );
+    }
+
+    let (qe, qa, qb, qd, ql, qlb) = (
         layout::q_edges(),
         layout::q_alias(),
         layout::q_born(),
@@ -128,8 +144,7 @@ pub async fn build_from_server(
         layout::q_labels(),
         layout::q_link_born(),
     );
-    let (nodes, edges, aliases, born, dates, labels, link_born) = tokio::join!(
-        c.query::<layout::NodeRow>(&qn),
+    let (edges, aliases, born, dates, labels, link_born) = tokio::join!(
         c.query::<layout::EdgeRow>(&qe),
         c.query::<layout::AliasRow>(&qa),
         c.query::<layout::BornRow>(&qb),
@@ -138,13 +153,6 @@ pub async fn build_from_server(
         c.query::<layout::LinkBornRow>(&qlb),
     );
 
-    let nodes = nodes?;
-    if nodes.is_empty() {
-        return Err(
-            "this store has no documents in its `now` view — run `git lex sync` in the repo"
-                .to_string(),
-        );
-    }
     // The remaining reads may legitimately come back empty: a soul with no
     // links, or one whose history graph has not been built, still has a
     // legible spiral. What it must not do is pretend — `undated` and
