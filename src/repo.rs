@@ -133,6 +133,10 @@ impl RepoFamily {
 /// tell" must never render as "current" — zero is the reassuring answer and
 /// it is exactly the fallback that produced four separate wrong captions on
 /// 2026-08-27.
+/// **Superseded as the primary source on 2026-09-22 — see `from_daemon`.**
+/// The spine reading below is now the fallback for a repo `gitlexd` does not
+/// hold, and everything it says about markers is still true of it.
+///
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum GraphFreshness {
@@ -166,6 +170,39 @@ pub enum GraphFreshness {
     },
     /// No store at all. This repo has never been synced.
     NeverSynced,
+}
+
+impl GraphFreshness {
+    /// The graph's position as the process that WRITES it reports it, rather
+    /// than as the filename left behind by a process that used to.
+    ///
+    /// This closed a false alarm that had been open for two days. The reading
+    /// below this one compares the spine file against the store's newest data
+    /// file, and flags a store written after its own marker. That was right
+    /// while `git lex sync` was the only writer, because it wrote both. It
+    /// stopped being right the moment `gitlexd` took over syncing: the daemon
+    /// holds every store open and rebuilds it on a timer, and the spine file
+    /// is not its to maintain. Measured 2026-09-22 across 29 repos — six
+    /// carried a warning triangle while the daemon reported them synced to
+    /// exactly HEAD, and every store on the machine had been written hours
+    /// after its spine.
+    ///
+    /// The lesson is a turn past the one already written down. A marker does
+    /// not only drift away from the thing it marks; when the thing changes
+    /// hands, the marker goes on describing the previous owner's habits, and
+    /// it does so confidently. So ask the current owner.
+    pub fn from_daemon(synced_to: Option<&str>, head: Option<&str>, syncing: bool) -> Self {
+        match (synced_to, head) {
+            // Mid-sync, so any distance is about to be wrong. Placed as
+            // unplaceable rather than guessed at.
+            _ if syncing => GraphFreshness::Unplaceable,
+            (None, _) => GraphFreshness::NeverSynced,
+            (Some(sha), Some(h)) if sha == h => GraphFreshness::Current { sha: sha.to_string() },
+            // Behind, and the distance is counted by the caller, which has
+            // the repo to count it in. `None` is "I cannot tell", never zero.
+            (Some(sha), _) => GraphFreshness::Behind { sha: sha.to_string(), commits: None },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -406,6 +443,47 @@ pub async fn probe_all(rows: Vec<(PathBuf, Option<String>)>) -> Vec<RepoProbe> {
 
 #[cfg(test)]
 mod tests {
+    use super::GraphFreshness as F;
+
+    /// The false alarm this reading exists to end. Six repos carried a
+    /// warning triangle on 2026-09-22 while the daemon had them synced to
+    /// exactly HEAD; the spine files were hours older because the daemon does
+    /// not write them.
+    #[test]
+    fn a_store_the_daemon_synced_to_head_is_current_however_old_its_spine_is() {
+        let f = F::from_daemon(Some("abc123"), Some("abc123"), false);
+        assert!(matches!(f, F::Current { .. }), "got {f:?}");
+    }
+
+    /// Behind is reported with no number here: the distance is counted in the
+    /// repo by the caller, and `None` means "not counted yet", never zero.
+    #[test]
+    fn a_store_short_of_head_is_behind_without_inventing_a_distance() {
+        match F::from_daemon(Some("older"), Some("newer"), false) {
+            F::Behind { sha, commits } => {
+                assert_eq!(sha, "older");
+                assert_eq!(commits, None);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A repo git-lex has never been run in. Distinct from behind: there is
+    /// nothing to catch up, there is nothing at all.
+    #[test]
+    fn a_soul_the_daemon_has_never_synced_is_never_synced() {
+        assert!(matches!(F::from_daemon(None, Some("abc"), false), F::NeverSynced));
+    }
+
+    /// Mid-sync, every distance is about to be wrong, so none is offered.
+    /// "I cannot tell" must never render as "current" — that fallback is what
+    /// produced four wrong captions on 2026-08-27.
+    #[test]
+    fn a_store_being_synced_right_now_is_not_called_current() {
+        let f = F::from_daemon(Some("abc123"), Some("abc123"), true);
+        assert!(matches!(f, F::Unplaceable), "got {f:?}");
+    }
+
     use super::*;
 
     fn repo(dir: &Path) -> String {

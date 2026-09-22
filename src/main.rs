@@ -1,21 +1,25 @@
 //! git-lex-ui — a front door to every git-lex repo on the machine.
 //!
-//! Today, looking at a soul means knowing its path, cd-ing there, running
-//! `git lex serve viz --port N`, and remembering which port went to which
-//! soul. This starts once on a fixed port, reads the machine registry, drops
-//! the entries that have rotted, shows what is left, and starts the right
-//! server when you pick one.
+//! It starts once on a fixed port, reads the machine registry, drops the
+//! entries that have rotted, and draws whichever repo you pick.
 //!
-//! The browser only ever talks to this process. Per-repo servers are children
-//! behind a proxy keyed on each repo's genesis sha — its permanent identity —
-//! never on a port number, because a port number is a place and not a name.
+//! The data comes from `gitlexd`, the one store daemon on the machine, which
+//! holds every registered repo and answers for each one by its genesis sha.
+//! Until 2026-09-22 this file supervised a `git-lex-serve sparql` process per
+//! repo and translated genesis shas into port numbers, because a port number
+//! is a place and not a name. git-lex removed that command and its binary
+//! (merge f428987, @w4r3z) in favour of the daemon, which takes the name
+//! directly — so the translation, and the twenty-eight processes it used to
+//! keep alive, are both gone. See `daemon.rs`.
+//!
+//! The browser still only ever talks to this process.
 
+mod daemon;
 mod layout;
-mod sparql;
 mod layout_api;
 mod registry;
 mod repo;
-mod supervisor;
+mod sparql;
 
 use axum::{
     Router,
@@ -25,11 +29,11 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use daemon::Daemon;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use supervisor::Supervisor;
 use tokio::sync::RwLock;
 
 #[derive(Parser, Debug)]
@@ -43,10 +47,10 @@ struct Args {
     #[arg(long, default_value = "8888")]
     port: u16,
 
-    /// First port to hand to per-repo servers. Each child may walk up to 20
-    /// ports from where it is told to start, so allocations are spaced.
-    #[arg(long, default_value = "7900")]
-    repo_port_floor: u16,
+    /// Where `gitlexd` listens. Fixed by git-lex; a flag only so a test
+    /// daemon can be pointed at.
+    #[arg(long, default_value_t = daemon::DAEMON_PORT)]
+    daemon_port: u16,
 
     /// Read the registry but do not rewrite it. The registry is a shared,
     /// live file; this is the flag for when you want to look without
@@ -70,7 +74,10 @@ struct AppState {
     by_genesis: RwLock<HashMap<String, String>>,
     prune: RwLock<Option<registry::PruneReport>>,
     dropped: RwLock<Vec<registry::Classified>>,
-    sup: Arc<Supervisor>,
+    lexd: Arc<Daemon>,
+    /// What the daemon looked like at the last poll. Refreshed on a timer, so
+    /// a page left open for an hour finds out when the feed dies.
+    lexd_status: RwLock<daemon::DaemonStatus>,
     http: reqwest::Client,
     web_dir: PathBuf,
     lex_dir: PathBuf,
@@ -112,17 +119,40 @@ async fn main() {
 
     let web_dir = args.web.clone().unwrap_or_else(default_web_dir);
 
-    let sup = Supervisor::new(args.repo_port_floor, &cache_dir);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_default();
+    let lexd = Arc::new(Daemon::new(http.clone(), args.daemon_port));
+
+    // Ask before drawing anything. The daemon is usually already up — `git
+    // lex query` starts one on demand — and when it is not, starting it is
+    // safe to do blind, because the port is the lock and a second daemon
+    // exits on its own.
+    let boot = lexd.ensure().await;
+    if boot.reachable {
+        println!(
+            "gitlexd on port {}: {} soul(s) held{}",
+            boot.port,
+            boot.souls.len(),
+            boot.message.as_deref().map(|m| format!(" ({m})")).unwrap_or_default()
+        );
+    } else {
+        eprintln!(
+            "git-lex-ui: {}",
+            boot.message.as_deref().unwrap_or("gitlexd is not answering")
+        );
+        eprintln!("The front door still starts — you just cannot draw anything until it is.");
+    }
+
     let state = Arc::new(AppState {
         repos: RwLock::new(vec![]),
         by_genesis: RwLock::new(HashMap::new()),
         prune: RwLock::new(None),
         dropped: RwLock::new(vec![]),
-        sup: Arc::clone(&sup),
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap_or_default(),
+        lexd: Arc::clone(&lexd),
+        lexd_status: RwLock::new(boot),
+        http,
         web_dir: web_dir.clone(),
         lex_dir: lex_dir.clone(),
         cache_dir: cache_dir.clone(),
@@ -138,25 +168,11 @@ async fn main() {
         eprintln!("The front door still starts — you just get an empty list until this is fixed.");
     }
 
-    // Take over anything a previous run left behind, before serving. Without
-    // this, a supervisor that was killed rather than shut down starts a
-    // second server for a repo that already has one, and the first keeps its
-    // port forever.
-    {
-        let repos = state.repos.read().await.clone();
-        let n = sup.adopt_existing(&repos).await;
-        if n > 0 {
-            println!("adopted {n} server(s) left running by a previous start");
-        }
-    }
-
     let app = Router::new()
         .route("/", get(index))
         .route("/api/repos", get(api_repos))
         .route("/api/repos/reload", post(api_reload))
-        .route("/api/servers", get(api_servers))
-        .route("/api/servers/open", post(api_open))
-        .route("/api/servers/stop", post(api_stop))
+        .route("/api/feed", get(api_feed))
         .route("/api/health", get(api_health))
         .route("/api/layout/{genesis}", get(api_layout_meta))
         .route("/api/layout/{genesis}/data", get(api_layout_data))
@@ -187,27 +203,30 @@ async fn main() {
     println!("git-lex-ui listening on {url}");
     println!("Frontend served from {}", web_dir.display());
     println!("Registry: {}", lex_dir.join("repos.*").display());
-    println!("Per-repo data feed: git-lex-serve sparql, from {}", args.repo_port_floor);
+    println!("Data feed: gitlexd on 127.0.0.1:{}", args.daemon_port);
     if !args.no_open {
         let _ = open::that_detached(&url);
     }
 
     // Health is asked on a timer, not remembered. A page left open for an
-    // hour finds out its server died.
-    let health_sup = Arc::clone(&sup);
+    // hour finds out its feed died.
+    let health_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tick.tick().await;
-            health_sup.refresh_health().await;
+            let next = health_state.lexd.status().await;
+            *health_state.lexd_status.write().await = next;
         }
     });
 
-    let shutdown_sup = Arc::clone(&sup);
+    // Nothing of ours to shut down any more. The daemon belongs to the
+    // machine, not to this process — leaving it running is correct, and
+    // killing it would take the store out from under `git lex query` in every
+    // other terminal on the box.
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
-        println!("\nshutting down child servers…");
-        shutdown_sup.stop_all().await;
+        println!();
     });
     if let Err(e) = serve.await {
         eprintln!("server error: {e}");
@@ -275,6 +294,13 @@ async fn load_registry(state: &Arc<AppState>, do_prune: bool) -> Result<(), Stri
         .collect();
     let mut probes = repo::probe_all(rows).await;
 
+    dedupe_by_genesis(&mut probes, |p| {
+        std::path::Path::new(p)
+            .canonicalize()
+            .map(|c| c == std::path::Path::new(p))
+            .unwrap_or(false)
+    });
+
     // Most recent first. `recency_source` travels with every row so the
     // column can say which clock it used — 46 of 50 registry entries have no
     // `last_used`, so most of this ordering is commit time wearing a
@@ -290,6 +316,116 @@ async fn load_registry(state: &Arc<AppState>, do_prune: bool) -> Result<(), Stri
     *state.by_genesis.write().await = map;
     *state.repos.write().await = probes;
     Ok(())
+}
+
+/// One row per repo, not one row per path that reaches it.
+///
+/// The registry is a list of absolute paths, and on 2026-09-22 every repo
+/// moved from `~/repos` to `/Volumes/f00/repos` with `~/repos` left behind as
+/// a symlink. Nine repos ended up in the file under both spellings, and
+/// because each row is probed independently, both spellings passed every
+/// liveness check — so the picker showed nine souls twice. Neither row was
+/// wrong. They were the same repo.
+///
+/// A path is a place and the genesis sha is the name, so the dedupe is on the
+/// name. The survivor is the row whose path is already canonical — the real
+/// location rather than a route to it — because that is the path handed to
+/// `git -C` and shown in the interface. When neither is canonical, or both
+/// are, the first one wins, which keeps the registry's own order.
+fn dedupe_by_genesis(probes: &mut Vec<repo::RepoProbe>, canonical: impl Fn(&str) -> bool) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut keep = vec![true; probes.len()];
+    for i in 0..probes.len() {
+        // A repo with no genesis sha has no name to be deduped on, and there
+        // is nothing to gain by guessing one. Every such row is kept.
+        let Some(g) = probes[i].genesis_sha.clone() else { continue };
+        match seen.get(&g).copied() {
+            None => {
+                seen.insert(g, i);
+            }
+            Some(first) => {
+                let loser = if canonical(&probes[i].path) && !canonical(&probes[first].path) {
+                    seen.insert(g, i);
+                    first
+                } else {
+                    i
+                };
+                keep[loser] = false;
+            }
+        }
+    }
+    let mut it = keep.iter();
+    probes.retain(|_| *it.next().unwrap_or(&true));
+}
+
+/// Replace each row's spine-derived freshness with the daemon's own answer.
+///
+/// `gitlexd` holds every store open and syncs it itself, so it knows which
+/// commit each graph was built up to. The spine file on disk is a marker for
+/// the same fact, written by a command that no longer does the syncing — and
+/// on 2026-09-22 it put a warning triangle beside six repos that were synced
+/// to exactly HEAD. Ask the writer.
+///
+/// The spine reading is kept for any repo the daemon does not hold, which is
+/// the only case where nobody current can be asked.
+async fn overlay_daemon_freshness(s: &Arc<AppState>) {
+    let st = s.lexd.status().await;
+    *s.lexd_status.write().await = st.clone();
+    if !st.reachable {
+        return;
+    }
+    let by_genesis: HashMap<&str, &daemon::Soul> =
+        st.souls.iter().map(|x| (x.genesis.as_str(), x)).collect();
+
+    let mut repos = s.repos.write().await;
+    for r in repos.iter_mut() {
+        let Some(g) = r.genesis_sha.as_deref() else { continue };
+        let Some(soul) = by_genesis.get(g) else { continue };
+        r.graph = repo::GraphFreshness::from_daemon(
+            soul.synced_to.as_deref(),
+            r.head_sha.as_deref(),
+            soul.syncing,
+        );
+    }
+    drop(repos);
+
+    // Count the distance for anything behind. One `git rev-list` per behind
+    // repo, and normally there are none — the daemon syncs within a couple of
+    // seconds of a commit — so this is the rare path, not the common one.
+    let behind: Vec<(String, String, String)> = s
+        .repos
+        .read()
+        .await
+        .iter()
+        .filter_map(|r| match (&r.graph, &r.head_sha) {
+            (repo::GraphFreshness::Behind { sha, commits: None }, Some(head)) => {
+                Some((r.path.clone(), sha.clone(), head.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if behind.is_empty() {
+        return;
+    }
+    let counted = futures_util::future::join_all(behind.into_iter().map(|(path, sha, head)| async move {
+        let n = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-list", "--count", &format!("{sha}..{head}")])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok());
+        (path, sha, n)
+    }))
+    .await;
+    let mut repos = s.repos.write().await;
+    for (path, sha, commits) in counted {
+        if let Some(r) = repos.iter_mut().find(|r| r.path == path) {
+            r.graph = repo::GraphFreshness::Behind { sha, commits };
+        }
+    }
 }
 
 // ---------------------------------------------------------------- endpoints
@@ -346,6 +482,7 @@ async fn api_repos(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         .await;
         *s.repos.write().await = refreshed;
     }
+    overlay_daemon_freshness(&s).await;
     let repos = s.repos.read().await.clone();
     let dropped = s.dropped.read().await.clone();
     let count_of = |v: registry::Verdict| dropped.iter().filter(|d| d.verdict == v).count();
@@ -380,39 +517,20 @@ async fn api_reload(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-async fn api_servers(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    s.sup.refresh_health().await;
-    axum::Json(s.sup.status_all().await)
-}
-
-#[derive(Deserialize)]
-struct PathBody {
-    path: String,
-}
-
-async fn api_open(
-    State(s): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<PathBody>,
-) -> impl IntoResponse {
-    let found = s.repos.read().await.iter().find(|r| r.path == body.path).cloned();
-    let Some(target) = found else {
-        return (
-            StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "error": format!("{} is not in the shown repo list", body.path)
-            })),
-        );
-    };
-    let st = s.sup.ensure(&target).await;
-    (StatusCode::OK, axum::Json(serde_json::to_value(st).unwrap_or_default()))
-}
-
-async fn api_stop(
-    State(s): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<PathBody>,
-) -> impl IntoResponse {
-    let stopped = s.sup.stop(&body.path).await;
-    axum::Json(serde_json::json!({ "stopped": stopped }))
+/// The state of the one data feed, and which souls it holds.
+///
+/// This replaced three routes — list the per-repo servers, start one, stop
+/// one — because there is nothing per-repo left to start. A page that cannot
+/// draw now has exactly one thing to check, and it is named here rather than
+/// inferred from a column of unreachable children.
+///
+/// It asks the daemon rather than serving the timer's snapshot, so a page
+/// that opens right after the daemon comes back does not have to wait out the
+/// poll to find that out.
+async fn api_feed(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let fresh = s.lexd.status().await;
+    *s.lexd_status.write().await = fresh.clone();
+    axum::Json(fresh)
 }
 
 async fn api_health(State(s): State<Arc<AppState>>) -> impl IntoResponse {
@@ -422,18 +540,26 @@ async fn api_health(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "web_dir": s.web_dir.display().to_string(),
         "web_dir_present": s.web_dir.is_dir(),
         "cache_dir": s.cache_dir.display().to_string(),
-        "feed": "git-lex-serve sparql",
+        "feed": "gitlexd",
+        "feed_port": s.lexd.port(),
+        "feed_reachable": s.lexd_status.read().await.reachable,
     }))
 }
 
 // ------------------------------------------------------------------- layout
 
-/// Resolve a genesis sha to a live, verified server AND the repo it belongs
-/// to, since the layout needs the repo's HEAD to key its cache.
+/// Resolve a genesis sha to the repo it belongs to, re-probed, since the
+/// layout needs the repo's HEAD to key its cache.
+///
+/// This used to also resolve a port, and to fail when no child server was
+/// answering for that repo. The daemon holds every registered soul, so the
+/// only remaining way to have nothing to ask is for the daemon itself to be
+/// down — which `held_by_daemon` reports as one fact about the feed rather
+/// than as this repo being broken.
 async fn layout_target(
     s: &Arc<AppState>,
     genesis: &str,
-) -> Result<(repo::RepoProbe, u16), (StatusCode, String)> {
+) -> Result<repo::RepoProbe, (StatusCode, String)> {
     let path = s.by_genesis.read().await.get(genesis).cloned().ok_or((
         StatusCode::NOT_FOUND,
         format!("no repo on this machine has genesis {genesis}"),
@@ -463,13 +589,40 @@ async fn layout_target(
             *slot = probe.clone();
         }
     }
-    let port = s.sup.proxy_port(&path).await.ok_or_else(|| {
-        (
+    held_by_daemon(s, genesis).await?;
+    Ok(probe)
+}
+
+/// Confirm the daemon is answering AND holds this soul, before anything asks
+/// it a question.
+///
+/// The two failures read very differently to whoever is looking at the page,
+/// so they are never merged: a daemon that is down is one problem for the
+/// whole machine, and a soul the daemon does not hold is one repo that git-lex
+/// has not been run in. The second used to be impossible to express — the
+/// supervisor would simply start a server — and saying "nothing is answering"
+/// for it would send someone to restart a daemon that is fine.
+async fn held_by_daemon(s: &Arc<AppState>, genesis: &str) -> Result<(), (StatusCode, String)> {
+    let st = s.lexd.status().await;
+    *s.lexd_status.write().await = st.clone();
+    if !st.reachable {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "no verified server is running for this repo".to_string(),
-        )
-    })?;
-    Ok((probe, port))
+            st.message.unwrap_or_else(|| {
+                format!("gitlexd is not answering on port {}", st.port)
+            }),
+        ));
+    }
+    if st.souls.iter().any(|x| x.genesis == genesis) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "gitlexd is running but does not hold this repo — run `git lex sync` in it once, \
+             and it will be picked up"
+        ),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -507,7 +660,7 @@ async fn api_layout_meta(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let (probe, port) = match layout_target(&s, &genesis).await {
+    let probe = match layout_target(&s, &genesis).await {
         Ok(v) => v,
         Err((c, m)) => return (c, m).into_response(),
     };
@@ -531,7 +684,7 @@ async fn api_layout_meta(
 
     let built = match layout_api::build_from_server(
         &s.http,
-        port,
+        s.lexd.port(),
         &genesis,
         &head,
         std::path::Path::new(&probe.path),
@@ -585,56 +738,35 @@ async fn api_layout_data(
 
 // -------------------------------------------------------------------- proxy
 
-/// Resolve a genesis sha to the port of a *verified, currently answering*
-/// server for that repo. Anything less than that returns an error the page
-/// can show, never a silent fallback to whatever is listening.
-async fn resolve_port(s: &Arc<AppState>, genesis: &str) -> Result<u16, (StatusCode, String)> {
-    let path = s
-        .by_genesis
-        .read()
-        .await
-        .get(genesis)
-        .cloned()
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("no repo on this machine has genesis {genesis}"),
-        ))?;
-    match s.sup.proxy_port(&path).await {
-        Some(p) => Ok(p),
-        None => {
-            let st = s.sup.status_of(&path).await;
-            let detail = st
-                .as_ref()
-                .and_then(|x| x.message.clone())
-                .unwrap_or_else(|| "no server is running for this repo".to_string());
-            Err((StatusCode::SERVICE_UNAVAILABLE, detail))
-        }
-    }
-}
-
-/// Pass a SPARQL query through to one repo's endpoint.
+/// Pass a SPARQL query through to one soul on the daemon.
 ///
-/// The browser never learns a port. It addresses a soul by its genesis sha —
-/// its permanent identity — and this resolves that to a server that is
-/// currently answering AND has been confirmed to be that repo. A port is a
-/// place; it is not a name, and on a machine running a dozen souls the
-/// difference is one soul's page showing another soul's data.
+/// The browser never learns a port — it addresses a soul by its genesis sha,
+/// and so, now, does the daemon. This used to be the place where a name was
+/// turned into a port, and the care it took was the difference between one
+/// soul's page and another soul's data. That care is now structural: there is
+/// one port for the machine and the name travels all the way down.
 async fn proxy_sparql(
     State(s): State<Arc<AppState>>,
     AxPath(genesis): AxPath<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let port = match resolve_port(&s, &genesis).await {
-        Ok(p) => p,
-        Err((c, m)) => return (c, m).into_response(),
-    };
+    if s.by_genesis.read().await.get(&genesis).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no repo on this machine has genesis {genesis}"),
+        )
+            .into_response();
+    }
+    if let Err((c, m)) = held_by_daemon(&s, &genesis).await {
+        return (c, m).into_response();
+    }
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/sparql-query")
         .to_string();
-    let url = format!("http://127.0.0.1:{port}/sparql");
+    let url = format!("{}/sparql", s.lexd.soul_base(&genesis));
     match s
         .http
         .post(&url)
@@ -647,7 +779,7 @@ async fn proxy_sparql(
         Ok(r) => relay(r).await,
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            format!("the data endpoint for this repo stopped answering: {e}"),
+            format!("gitlexd stopped answering for this repo: {e}"),
         )
             .into_response(),
     }
@@ -791,24 +923,32 @@ async fn api_file(
 }
 
 
-// --- running `git lex sync` from the front door ---------------------------
+// --- asking the daemon to sync one soul -----------------------------------
 //
 // The only write this tool performs, and it is deliberately the narrowest one
 // possible: it rebuilds a DERIVED store from commits that already exist. It
 // creates no commits, changes no tracked file, and loses nothing that is not
 // regenerable from git.
 //
+// It used to shell out to `git lex sync` in the repo's directory. It asks the
+// daemon now, and that is a correctness change rather than a tidy-up: gitlexd
+// holds every store OPEN, so a second process writing the same database is
+// two writers on one file. Asking the process that already holds it is the
+// only way to have one.
+//
 // It earns its place because "13 of 15 graphs are behind" was true for two
 // weeks and the answer was always the same command in a different directory.
 // A banner that states a problem you have to go elsewhere to fix is a label
-// with no action attached — it was replaced by this.
+// with no action attached — it was replaced by this. The daemon now also
+// syncs within a couple of seconds of any commit on its own, so this is the
+// button for the case where that did not happen, not the normal path.
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 enum SyncState {
     Running { started_ms: u128 },
-    /// Finished cleanly. `summary` is git-lex's own last line, so the number
-    /// shown is the tool's, not ours.
+    /// Finished cleanly. `summary` is built from the daemon's own reply, so
+    /// the figures shown are its, not ours.
     Done { ms: u128, summary: String },
     /// Finished badly. The message is kept verbatim: a sync failure is
     /// usually a real fact about the repo and paraphrasing it loses the fix.
@@ -829,17 +969,22 @@ async fn api_sync_start(
     axum::Json(body): axum::Json<SyncRequest>,
 ) -> Response {
     // Only repos this front door already knows about. The path arrives from
-    // the browser, and `git lex sync` in an arbitrary directory is not
-    // something a page should be able to ask for.
+    // the browser, and a sync of an arbitrary directory is not something a
+    // page should be able to ask for.
     let known = s
         .repos
         .read()
         .await
         .iter()
-        .any(|r| r.path == body.path);
-    if !known {
-        return (StatusCode::NOT_FOUND, "no such repo in the registry").into_response();
-    }
+        .find(|r| r.path == body.path)
+        .and_then(|r| r.genesis_sha.clone());
+    let Some(genesis) = known else {
+        return (
+            StatusCode::NOT_FOUND,
+            "no such repo in the registry, or it has no genesis commit",
+        )
+            .into_response();
+    };
 
     {
         let syncs = s.syncs.read().await;
@@ -857,71 +1002,128 @@ async fn api_sync_start(
     let st = s.clone();
     let path = body.path.clone();
     tokio::spawn(async move {
-        let out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .args(["lex", "sync"])
-            .output()
-            .await;
+        let out = st.lexd.sync(&genesis).await;
         let ms = now_ms().saturating_sub(started);
         let next = match out {
-            Ok(o) if o.status.success() => {
-                let text = String::from_utf8_lossy(&o.stdout);
-                // git-lex's own result line, so the figures are its own.
-                //
-                // Not simply the LAST line. The first version took that, and
-                // on a real sync the last line was housekeeping ("Agent
-                // context: .lex/COMPACT-ONTOLOGY.md updated") — a confident,
-                // well-formed summary of something other than the sync. The
-                // result line starts with "Synced in" or "Already synced";
-                // take it, and fall back to the last line only if git-lex
-                // ever stops printing one.
-                let summary = text
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| l.starts_with("Synced in") || l.starts_with("Already synced"))
-                    .or_else(|| text.lines().rev().map(str::trim).find(|l| !l.is_empty()))
-                    .unwrap_or("synced")
-                    .to_string();
-                SyncState::Done { ms, summary }
-            }
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr);
-                let msg = if err.trim().is_empty() {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+            Ok(soul) => {
+                // Say what actually happened, from the daemon's own numbers.
+                // A sync that failed inside the daemon still returns 200 with
+                // `last_error` set, so a reply that parsed is not by itself a
+                // success — the field has to be read.
+                if let Some(err) = soul.last_error.filter(|e| !e.trim().is_empty()) {
+                    SyncState::Failed { ms, message: err }
                 } else {
-                    err.trim().to_string()
-                };
-                SyncState::Failed { ms, message: msg }
+                    let took = soul
+                        .last_sync_ms
+                        .map(|n| format!("Synced in {n}ms"))
+                        .unwrap_or_else(|| "Synced".to_string());
+                    let at = soul
+                        .synced_to
+                        .as_deref()
+                        .map(|sha| format!(" — store now at {}", &sha[..sha.len().min(8)]))
+                        .unwrap_or_default();
+                    SyncState::Done { ms, summary: format!("{took}{at}") }
+                }
             }
-            Err(e) => SyncState::Failed { ms, message: e.to_string() },
+            Err(message) => SyncState::Failed { ms, message },
         };
         st.syncs.write().await.insert(path.clone(), next);
 
         // Drop this repo's cached layouts. They were built from the old
         // store, and a cache keyed by HEAD cannot see that the store beneath
         // it changed — the same blindness that made LAYOUT_VERSION necessary.
-        if let Some(g) = st
-            .repos
-            .read()
-            .await
-            .iter()
-            .find(|r| r.path == path)
-            .and_then(|r| r.genesis_sha.clone())
-        {
-            let dir = st.cache_dir.join(&g);
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    if e.file_name().to_string_lossy().starts_with("layout-") {
-                        let _ = std::fs::remove_file(e.path());
-                    }
+        let dir = st.cache_dir.join(&genesis);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with("layout-") {
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
-            let mut held = st.layouts.write().await;
-            held.remove(&layout_key(&g, layout::View::Base));
-            held.remove(&layout_key(&g, layout::View::Typed));
         }
+        let mut held = st.layouts.write().await;
+        held.remove(&layout_key(&genesis, layout::View::Base));
+        held.remove(&layout_key(&genesis, layout::View::Typed));
     });
 
     (StatusCode::ACCEPTED, axum::Json(SyncState::Running { started_ms: started })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two fields the dedupe reads, and nothing else. Everything a probe
+    /// carries is about DISPLAYING a repo; the dedupe is about identifying
+    /// one, and the test should fail if that ever stops being true.
+    fn probe(path: &str, genesis: Option<&str>) -> repo::RepoProbe {
+        repo::RepoProbe {
+            path: path.to_string(),
+            genesis_sha: genesis.map(str::to_string),
+            name: String::new(),
+            name_declared: false,
+            agent_name: None,
+            kit: None,
+            family: repo::RepoFamily::Plain,
+            optional_kits: vec![],
+            head_sha: None,
+            head_time: None,
+            commit_count: None,
+            recency: None,
+            recency_source: repo::RecencySource::Unknown,
+            graph: repo::GraphFreshness::NeverSynced,
+            has_www: false,
+            warnings: vec![],
+        }
+    }
+
+    /// The case that put nine souls in the list twice: one repo reachable at
+    /// two spellings after the volume move, both of them live.
+    #[test]
+    fn two_paths_to_one_repo_collapse_to_the_real_one() {
+        let mut v = vec![
+            probe("/Users/rob/repos/W3BL0RD", Some("e3d71e")),
+            probe("/Volumes/f00/repos/W3BL0RD", Some("e3d71e")),
+        ];
+        dedupe_by_genesis(&mut v, |p| p.starts_with("/Volumes"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "/Volumes/f00/repos/W3BL0RD");
+    }
+
+    /// Order in the file must not decide the answer. The same pair the other
+    /// way round keeps the same survivor.
+    #[test]
+    fn the_real_path_wins_whichever_way_round_the_rows_are() {
+        let mut v = vec![
+            probe("/Volumes/f00/repos/lUX", Some("aaa")),
+            probe("/Users/rob/repos/lUX", Some("aaa")),
+        ];
+        dedupe_by_genesis(&mut v, |p| p.starts_with("/Volumes"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "/Volumes/f00/repos/lUX");
+    }
+
+    /// Different repos are never merged, however alike their paths look. The
+    /// dedupe is on the name, and two names are two repos.
+    #[test]
+    fn repos_with_different_genesis_shas_are_left_alone() {
+        let mut v = vec![
+            probe("/Volumes/f00/repos/a", Some("aaa")),
+            probe("/Volumes/f00/repos/b", Some("bbb")),
+        ];
+        dedupe_by_genesis(&mut v, |_| true);
+        assert_eq!(v.len(), 2);
+    }
+
+    /// A repo with no genesis sha has no name, so it cannot be deduped and
+    /// must not be dropped. Several of them do not collapse into one.
+    #[test]
+    fn rows_without_a_genesis_sha_are_all_kept() {
+        let mut v = vec![
+            probe("/Volumes/f00/repos/x", None),
+            probe("/Volumes/f00/repos/y", None),
+            probe("/Volumes/f00/repos/z", Some("ccc")),
+        ];
+        dedupe_by_genesis(&mut v, |_| true);
+        assert_eq!(v.len(), 3);
+    }
 }

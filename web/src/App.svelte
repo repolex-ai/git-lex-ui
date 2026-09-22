@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from './lib/api'
-  import type { ReposResponse, RepoProbe, ServerStatus } from './lib/types'
+  import type { ReposResponse, RepoProbe, DaemonStatus } from './lib/types'
   import {
     loadLayout, Adjacency, trackPoints, neighbourhoodPositions, edgesToDraw,
     computeStates, type LayoutMeta, type Reading,
@@ -12,7 +12,7 @@
   import type { FileText, SyncState } from './lib/types'
 
   let data = $state<ReposResponse | null>(null)
-  let servers = $state<Record<string, ServerStatus>>({})
+  let feed = $state<DaemonStatus | null>(null)
   let error = $state<string | null>(null)
   let busy = $state<string | null>(null)
 
@@ -98,12 +98,11 @@
     }
   }
 
-  // Health is asked, never remembered: a page left open finds out its server
+  // Health is asked, never remembered: a page left open finds out its feed
   // died rather than continuing to render the last data it had.
-  async function pollServers() {
+  async function pollFeed() {
     try {
-      const list = await api.servers()
-      servers = Object.fromEntries(list.map((s) => [s.path, s]))
+      feed = await api.feed()
     } catch { /* the next tick will say so */ }
   }
 
@@ -147,9 +146,9 @@
 
   $effect(() => {
     loadRepos()
-    pollServers()
+    pollFeed()
     pollSyncs()
-    const t = setInterval(pollServers, 5000)
+    const t = setInterval(pollFeed, 5000)
     return () => {
       clearInterval(t)
       if (syncTimer) clearInterval(syncTimer)
@@ -163,10 +162,19 @@
     // both — the same file is the same dot's subject either way.
     const keepDoc = current?.path === repo.path && meta && selected !== null ? meta.docs[selected].id : null
     try {
-      const st = await api.open(repo.path)
-      servers = { ...servers, [repo.path]: st }
-      if (st.state !== 'ready') {
-        layoutErr = st.message ?? `server is ${st.state}`
+      // No server to start any more — the daemon already holds every
+      // registered soul. What is worth checking before drawing is whether it
+      // holds THIS one, because a repo git-lex has never been run in is a
+      // different problem from a daemon that is down, and sending someone to
+      // restart a healthy daemon costs more than the check.
+      const f = await api.feed()
+      feed = f
+      if (!f.reachable) {
+        layoutErr = f.message ?? `gitlexd is not answering on port ${f.port}`
+        return
+      }
+      if (repo.genesis_sha && !f.souls.some((x) => x.genesis === repo.genesis_sha)) {
+        layoutErr = 'gitlexd is running but does not hold this repo — run `git lex sync` in it once'
         return
       }
       const sameRepo = current?.path === repo.path
@@ -384,7 +392,7 @@
 
   <LeftRail
     repos={data?.repos ?? []}
-    {servers}
+    {feed}
     {current}
     {busy}
     {meta}

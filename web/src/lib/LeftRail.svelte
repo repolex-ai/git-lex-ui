@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { RepoProbe, ServerStatus, SyncState } from './types'
+  import type { RepoProbe, DaemonStatus, SyncState } from './types'
   import type { LayoutMeta, Reading } from './graph'
   import { kitLabel, ago } from './format'
 
   interface Props {
     repos: RepoProbe[]
-    servers: Record<string, ServerStatus>
+    feed: DaemonStatus | null
     current: RepoProbe | null
     busy: string | null
     meta: LayoutMeta | null
@@ -30,7 +30,7 @@
     onallpredicates: () => void
   }
   let {
-    repos, servers, current, busy, meta, syncs, onsync, visibleClasses, search, matchCount,
+    repos, feed, current, busy, meta, syncs, onsync, visibleClasses, search, matchCount,
     view, reading, onreading, hasSelection, onpick, ontoggle, onlyclass, onallclasses, onsearch, onview,
     visiblePredicates, ontogglepredicate, onlypredicate, onallpredicates,
   }: Props = $props()
@@ -114,12 +114,20 @@
     return st === 'behind' || st === 'spine-stale' || st === 'unplaceable'
   }
 
+  /** The per-row dot: can this repo be drawn right now, and if not, why.
+   *
+   *  It used to report one server process per repo. There are none — `gitlexd`
+   *  holds every registered soul — so the only two things left to say are
+   *  whether the daemon holds this one, and whether it is mid-sync. A repo the
+   *  daemon has never opened is not a broken repo: git-lex has simply not been
+   *  run in it yet. */
   function dot(r: RepoProbe): string {
-    const s = servers[r.path]
+    if (!feed || !feed.reachable) return 'bad'
+    const s = feed.souls.find((x) => x.genesis === r.genesis_sha)
     if (!s) return ''
-    if (s.state === 'ready') return 'on'
-    if (s.state === 'starting') return 'starting'
-    return 'bad'
+    if (s.syncing) return 'starting'
+    if (s.open_error || s.last_error) return 'bad'
+    return 'on'
   }
 </script>
 

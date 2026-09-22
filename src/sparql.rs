@@ -1,16 +1,20 @@
-//! Talking to a repo's `git-lex-serve sparql` endpoint.
+//! Running SPARQL against one soul held by `gitlexd`.
 //!
-//! This is the data feed. The other server — `git-lex-serve viz` — is the old
-//! viewer's own backend: it serves that viewer's HTML and script, and it opens
-//! a browser tab pointing at them every time it starts. Feeding a new
-//! interface from it meant every soul opened here also opened the old page,
-//! and it took a sandbox profile to stop something that should never have been
-//! in the path at all.
+//! Every query this tool makes goes through here, and the address is always
+//! `/soul/<genesis>/sparql` on the one daemon — a soul is named by its first
+//! commit, never by a port. That was a deliberate property back when the
+//! front door supervised a server per repo and had to translate names into
+//! ports; git-lex took the translation away on 2026-09-22 by making the
+//! daemon accept the name, so what used to be care is now just the shape.
 //!
-//! `sparql` is the endpoint with no interface attached. It binds the port it
-//! is given or exits, it has a real `/health`, an `/info` that names the repo
-//! it is serving, and it answers the W3C SPARQL protocol. Nothing about it
-//! wants to be looked at.
+//! Two differences from the `git lex serve sparql` endpoint this replaced,
+//! both worth knowing before writing a query here:
+//!
+//! - **The default graph is the union of every named graph.** A pattern with
+//!   no `GRAPH` clause now sees everything, where the old endpoint returned
+//!   nothing. `GRAPH ?g { ... }` behaves exactly as before, and every query in
+//!   this tool names its graph, so nothing here depends on either reading.
+//! - **`SERVICE` is refused.** No federation; nothing here asked for any.
 //!
 //! Results come back in the standard SPARQL JSON shape, which is a term
 //! object per binding. Everything here flattens that to a plain string map so
@@ -26,36 +30,9 @@ pub struct SparqlClient {
 }
 
 impl SparqlClient {
-    pub fn new(http: reqwest::Client, port: u16) -> Self {
-        Self { http, base: format!("http://127.0.0.1:{port}") }
-    }
-
-    pub fn base(&self) -> &str {
-        &self.base
-    }
-
-    /// Liveness only. Says the process is up and its store opened; says
-    /// nothing about WHICH repo, which is why it is never used alone.
-    pub async fn health(&self) -> Result<bool, String> {
-        let r = self
-            .http
-            .get(format!("{}/health", self.base))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let v: serde_json::Value = r.json().await.map_err(|e| e.to_string())?;
-        Ok(v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false))
-    }
-
-    /// The repo this endpoint is serving, as it reports itself.
-    pub async fn info(&self) -> Result<EndpointInfo, String> {
-        let r = self
-            .http
-            .get(format!("{}/info", self.base))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        r.json().await.map_err(|e| e.to_string())
+    /// One soul on the daemon, addressed by its genesis sha.
+    pub fn for_soul(http: reqwest::Client, daemon_port: u16, genesis: &str) -> Self {
+        Self { http, base: format!("http://127.0.0.1:{daemon_port}/soul/{genesis}") }
     }
 
     /// Run a query and flatten the bindings into plain rows.
@@ -81,16 +58,6 @@ impl SparqlClient {
 
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct EndpointInfo {
-    pub root: String,
-    #[serde(default)]
-    pub kit: Option<String>,
-    #[serde(default)]
-    pub optional_kits: Vec<String>,
-    #[serde(default)]
-    pub version: Option<String>,
-}
 
 /// `{"results":{"bindings":[{"n":{"type":"literal","value":"W3BL0RD"}}]}}`
 /// becomes `[{"n":"W3BL0RD"}]`.

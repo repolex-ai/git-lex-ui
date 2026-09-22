@@ -1,4 +1,4 @@
-import type { ReposResponse, ServerStatus, FileText, SyncState } from './types'
+import type { ReposResponse, DaemonStatus, FileText, SyncState } from './types'
 
 async function json<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error((await r.text()) || `${r.status} ${r.statusText}`)
@@ -8,7 +8,10 @@ async function json<T>(r: Response): Promise<T> {
 export const api = {
   repos: () => fetch('/api/repos').then(json<ReposResponse>),
 
-  servers: () => fetch('/api/servers').then(json<ServerStatus[]>),
+  /** The state of `gitlexd` and every soul it holds. One call, because
+   *  there is one feed — this replaced listing, starting and stopping a
+   *  server per repo, none of which exist any more. */
+  feed: () => fetch('/api/feed').then(json<DaemonStatus>),
 
   /** What every in-flight or finished sync is doing, keyed by repo path. */
   syncs: () => fetch('/api/sync').then(json<Record<string, SyncState>>),
@@ -36,24 +39,11 @@ export const api = {
     return { ...d, error: null }
   },
 
-  open: (path: string) =>
-    fetch('/api/servers/open', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ path }),
-    }).then(json<ServerStatus>),
-
-  stop: (path: string) =>
-    fetch('/api/servers/stop', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ path }),
-    }).then(json<{ stopped: boolean }>),
 }
 
-/** Run a SPARQL query against one repo's data endpoint, addressed by the
- *  repo's permanent identity rather than by a port. If that repo's endpoint is
- *  not running and verified, this fails loudly — it never falls through to
+/** Run a SPARQL query against one soul, addressed by the repo's permanent
+ *  identity rather than by a port. If the daemon is down, or does not hold
+ *  that soul, this fails loudly and says which — it never falls through to
  *  whatever else happens to be listening.
  *
  *  The endpoint speaks the W3C SPARQL protocol, so results arrive as a term

@@ -10,14 +10,6 @@ export type Verdict = 'live' | 'path-missing' | 'no-lex-dir' | 'scratch'
  *  commit time, and a column that mixes two clocks silently is a lie. */
 export type RecencySource = 'last-used' | 'head-commit' | 'unknown'
 
-export type ServerState =
-  | 'starting'
-  | 'ready'
-  | 'identity-mismatch'
-  | 'unreachable'
-  | 'exited'
-  | 'failed'
-
 export interface Classified {
   path: string
   last_used: string | null
@@ -100,15 +92,45 @@ export interface ReposResponse {
   counts: Counts
 }
 
-export interface ServerStatus {
+/** One repo as `gitlexd` reports it.
+ *
+ *  `synced_to` is the LIVE answer to how far a graph has fallen behind: the
+ *  commit the store was actually built up to, from the process that built it.
+ *  The spine file on disk is a marker standing in for the same fact, and a
+ *  marker drifts in both directions — silent when the store breaks, loud when
+ *  the store is merely opened. */
+export interface Soul {
+  genesis: string
+  name: string | null
   path: string
-  genesis_sha: string | null
-  state: ServerState
-  port: number | null
-  requested_port: number
-  pid: number | null
-  www_dir: string | null
-  last_seen_ms: number | null
+  synced_to: string | null
+  syncing: boolean
+  last_error: string | null
+  open_error: string | null
+  last_sync_ms: number | null
+  syncs: number | null
+}
+
+/** The state of the one data feed on the machine.
+ *
+ *  There is one of these, where there used to be one row per repo behind a
+ *  supervisor. A page that cannot draw has exactly one thing to check.
+ *
+ *  `reachable: false` with an empty `souls` is not the same as a daemon that
+ *  holds nothing, which is why the flag is carried separately from the list. */
+export interface DaemonStatus {
+  reachable: boolean
+  port: number
+  health: {
+    ok: boolean
+    pid: number | null
+    port: number | null
+    souls: number | null
+    syncing: number | null
+    uptime_secs: number | null
+    version: string | null
+  } | null
+  souls: Soul[]
   message: string | null
 }
 

@@ -84,17 +84,17 @@ pub fn store(cache_root: &Path, genesis: &str, head: &str, l: &Layout) -> Result
     Ok(meta_json)
 }
 
-/// Ask one repo's server for everything the layout needs, in parallel, then
+/// Ask the daemon for everything one soul's layout needs, in parallel, then
 /// compute it.
 pub async fn build_from_server(
     http: &reqwest::Client,
-    port: u16,
+    daemon_port: u16,
     genesis: &str,
     head: &str,
     repo_path: &std::path::Path,
     view: View,
 ) -> Result<Layout, String> {
-    let c = SparqlClient::new(http.clone(), port);
+    let c = SparqlClient::for_soul(http.clone(), daemon_port, genesis);
 
     // Six reads, all through the one SPARQL endpoint. The old viewer's
     // `/api/viz/nodes` and `/api/viz/edges` were only ever SPARQL wearing a
