@@ -44,8 +44,10 @@ pub struct Soul {
     pub name: Option<String>,
     pub path: String,
     /// The commit the store has been built up to. This is the LIVE answer to
-    /// how far a graph has fallen behind — the spine file on disk is a marker
-    /// standing in for it, and markers drift in both directions.
+    /// how far a graph has fallen behind, from the process that did the
+    /// building. Everything else available is a trace left on disk, and a
+    /// trace has to be interpreted — which is where the reading before this
+    /// one went wrong. See `GraphFreshness::from_daemon`.
     #[serde(default)]
     pub synced_to: Option<String>,
     #[serde(default)]

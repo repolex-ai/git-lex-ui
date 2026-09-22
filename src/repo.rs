@@ -176,21 +176,35 @@ impl GraphFreshness {
     /// The graph's position as the process that WRITES it reports it, rather
     /// than as the filename left behind by a process that used to.
     ///
-    /// This closed a false alarm that had been open for two days. The reading
-    /// below this one compares the spine file against the store's newest data
-    /// file, and flags a store written after its own marker. That was right
-    /// while `git lex sync` was the only writer, because it wrote both. It
-    /// stopped being right the moment `gitlexd` took over syncing: the daemon
-    /// holds every store open and rebuilds it on a timer, and the spine file
-    /// is not its to maintain. Measured 2026-09-22 across 29 repos — six
-    /// carried a warning triangle while the daemon reported them synced to
-    /// exactly HEAD, and every store on the machine had been written hours
-    /// after its spine.
+    /// This closed a false alarm that had been open for two days, and the
+    /// reason is not the one it looked like.
     ///
-    /// The lesson is a turn past the one already written down. A marker does
-    /// not only drift away from the thing it marks; when the thing changes
-    /// hands, the marker goes on describing the previous owner's habits, and
-    /// it does so confidently. So ask the current owner.
+    /// The reading below this one compares the spine file against the store's
+    /// newest data file and flags a store written after its own marker. The
+    /// spine is fine: git-lex refreshes it at the tail of every sync, the
+    /// daemon's syncs included, and the sha in its name is always truthful.
+    /// **What is not fine is inferring "the graph moved" from "a store file
+    /// changed", because merely OPENING a RocksDB store rewrites it** — the
+    /// bookkeeping files every time, and `.sst` data files whenever the open
+    /// triggers a compaction. `gitlexd` opens every store on the machine when
+    /// it starts, so from 2026-09-22 this fired on all of them: six repos
+    /// carried a warning triangle while the daemon reported them synced to
+    /// exactly HEAD. On 4RX the spine named HEAD, and every file in the store
+    /// was stamped 14:01 — the second the daemon started.
+    ///
+    /// This is the second time the same door has been walked through. On
+    /// 2026-09-16 the check compared the store FOLDER's timestamp, and opening
+    /// a store bumped it; the fix was to look only at `.sst` files, on the
+    /// belief that data files change when facts change. They also change when
+    /// nobody changes anything. Narrowing an over-broad signal is not the same
+    /// as establishing that what is left means what you want it to mean, and a
+    /// detector that responds to being LOOKED AT is the flinch test failing on
+    /// the instrument itself.
+    ///
+    /// So the answer is not a narrower proxy. It is to ask the process that
+    /// does the writing what it wrote, which is what this does. Credit to
+    /// @w4r3z, who read a claim of mine that the daemon had stopped
+    /// maintaining the spine and showed it was false in one line.
     pub fn from_daemon(synced_to: Option<&str>, head: Option<&str>, syncing: bool) -> Self {
         match (synced_to, head) {
             // Mid-sync, so any distance is about to be wrong. Placed as
@@ -447,8 +461,9 @@ mod tests {
 
     /// The false alarm this reading exists to end. Six repos carried a
     /// warning triangle on 2026-09-22 while the daemon had them synced to
-    /// exactly HEAD; the spine files were hours older because the daemon does
-    /// not write them.
+    /// exactly HEAD — not because the spine had gone unwritten, but because
+    /// the daemon had OPENED every store, and an open leaves the same traces
+    /// on disk that real work does.
     #[test]
     fn a_store_the_daemon_synced_to_head_is_current_however_old_its_spine_is() {
         let f = F::from_daemon(Some("abc123"), Some("abc123"), false);

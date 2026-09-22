@@ -362,9 +362,12 @@ fn dedupe_by_genesis(probes: &mut Vec<repo::RepoProbe>, canonical: impl Fn(&str)
 ///
 /// `gitlexd` holds every store open and syncs it itself, so it knows which
 /// commit each graph was built up to. The spine file on disk is a marker for
-/// the same fact, written by a command that no longer does the syncing — and
-/// on 2026-09-22 it put a warning triangle beside six repos that were synced
-/// to exactly HEAD. Ask the writer.
+/// the same fact — still truthfully written, but read here through an
+/// inference that broke: "a store file is newer than the spine" was taken to
+/// mean "the graph moved past its marker", and opening a store rewrites its
+/// files without moving anything. The daemon opens every store when it
+/// starts, so on 2026-09-22 that put a warning triangle beside six repos
+/// synced to exactly HEAD. Ask the writer instead of reading the traces.
 ///
 /// The spine reading is kept for any repo the daemon does not hold, which is
 /// the only case where nobody current can be asked.

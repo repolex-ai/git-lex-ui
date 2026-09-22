@@ -96,9 +96,9 @@ export interface ReposResponse {
  *
  *  `synced_to` is the LIVE answer to how far a graph has fallen behind: the
  *  commit the store was actually built up to, from the process that built it.
- *  The spine file on disk is a marker standing in for the same fact, and a
- *  marker drifts in both directions — silent when the store breaks, loud when
- *  the store is merely opened. */
+ *  Everything else on disk is a trace of that work rather than a statement of
+ *  it — and a trace gets left just as readily by someone merely OPENING the
+ *  store, which is how six healthy repos wore a warning on 2026-09-22. */
 export interface Soul {
   genesis: string
   name: string | null
