@@ -592,40 +592,59 @@ async fn layout_target(
             *slot = probe.clone();
         }
     }
-    held_by_daemon(s, genesis).await?;
+    daemon_reachable(s).await?;
     Ok(probe)
 }
 
-/// Confirm the daemon is answering AND holds this soul, before anything asks
-/// it a question.
+/// Confirm the daemon is answering at all, before anything asks it a question.
 ///
-/// The two failures read very differently to whoever is looking at the page,
-/// so they are never merged: a daemon that is down is one problem for the
-/// whole machine, and a soul the daemon does not hold is one repo that git-lex
-/// has not been run in. The second used to be impossible to express — the
-/// supervisor would simply start a server — and saying "nothing is answering"
-/// for it would send someone to restart a daemon that is fine.
-async fn held_by_daemon(s: &Arc<AppState>, genesis: &str) -> Result<(), (StatusCode, String)> {
+/// **It deliberately does NOT check whether the daemon holds this particular
+/// soul, and that is a correction rather than an omission.** The first version
+/// did, and refused with "gitlexd does not hold this repo". @w4r3z then made
+/// the daemon join a repo on the first save, sync or query that mentions it
+/// (git-lex main 688d53d) — so a soul missing from `/souls` is no longer a
+/// soul that cannot be asked, it is one that has not been asked yet. A gate
+/// reading a list that the asking itself would have changed turns a working
+/// request into a refusal, and the refusal names a cause that was already
+/// obsolete.
+///
+/// So this checks only the one fact that no request can fix — nothing is
+/// listening — and everything else is left to the attempt. What the attempt
+/// cannot say for itself, `explain_failure` supplies afterwards.
+async fn daemon_reachable(s: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
     let st = s.lexd.status().await;
     *s.lexd_status.write().await = st.clone();
-    if !st.reachable {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            st.message.unwrap_or_else(|| {
-                format!("gitlexd is not answering on port {}", st.port)
-            }),
-        ));
-    }
-    if st.souls.iter().any(|x| x.genesis == genesis) {
+    if st.reachable {
         return Ok(());
     }
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
-        format!(
-            "gitlexd is running but does not hold this repo — run `git lex sync` in it once, \
-             and it will be picked up"
-        ),
+        st.message
+            .unwrap_or_else(|| format!("gitlexd is not answering on port {}", st.port)),
     ))
+}
+
+/// Turn a failed request into a sentence worth reading, by asking afterwards
+/// what the attempt could not.
+///
+/// Ordered this way round on purpose. Asking first and acting second means the
+/// answer can go stale between the two; acting first and asking only when the
+/// action failed cannot, because by then there is a real failure to explain.
+async fn explain_failure(s: &Arc<AppState>, genesis: &str, err: String) -> String {
+    let st = s.lexd.status().await;
+    if !st.reachable {
+        return st
+            .message
+            .unwrap_or_else(|| format!("gitlexd stopped answering on port {}", st.port));
+    }
+    if !st.souls.iter().any(|x| x.genesis == genesis) {
+        return format!(
+            "gitlexd is running but has not picked up this repo. It joins one on its first \
+             save, sync or query — so if this persists, run `git lex sync` in the repo once. \
+             ({err})"
+        );
+    }
+    err
 }
 
 #[derive(Deserialize)]
@@ -696,7 +715,10 @@ async fn api_layout_meta(
     .await
     {
         Ok(l) => l,
-        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => {
+            let msg = explain_failure(&s, &genesis, e).await;
+            return (StatusCode::BAD_GATEWAY, msg).into_response();
+        }
     };
     let meta_json = match layout_api::store(&s.cache_dir, &genesis, &head, &built) {
         Ok(j) => j,
@@ -761,7 +783,7 @@ async fn proxy_sparql(
         )
             .into_response();
     }
-    if let Err((c, m)) = held_by_daemon(&s, &genesis).await {
+    if let Err((c, m)) = daemon_reachable(&s).await {
         return (c, m).into_response();
     }
     let ct = headers
@@ -780,11 +802,10 @@ async fn proxy_sparql(
         .await
     {
         Ok(r) => relay(r).await,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            format!("gitlexd stopped answering for this repo: {e}"),
-        )
-            .into_response(),
+        Err(e) => {
+            let msg = explain_failure(&s, &genesis, e.to_string()).await;
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
     }
 }
 
