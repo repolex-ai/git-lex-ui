@@ -87,24 +87,69 @@
   }
 
 
-  /** The list, split by what kind of repo each row is.
+  /** The list, split by which kit each repo runs.
    *
-   *  Souls first because they are the common case here, then other kits, then
-   *  plain markdown repos. Every group is always rendered when it has rows —
-   *  a single plain repo among twenty souls is exactly the row most likely to
-   *  be forgotten, and a header is what stops it disappearing into the
-   *  majority. Empty groups draw nothing; a heading over no rows is noise. */
-  const GROUPS: { key: string; label: string; note: string }[] = [
-    { key: 'soul', label: 'souls', note: 'running the soul kit — journal, notes, pursuits' },
-    { key: 'kitted', label: 'other kits', note: 'git-lex with a kit that is not the soul kit' },
-    { key: 'plain', label: 'markdown', note: 'the base case: markdown in git, no kit installed' },
+   *  Every repo runs the base kit — `git lex init` installs it — so base is
+   *  not a group of its own that other repos sit outside of; it is the floor
+   *  they all stand on. The groups are what sits on top of it: nothing (base
+   *  only), the soul kit, or some other kit (goodlux, 2026-09-24). A repo
+   *  with no kit recorded at all is counted as base only, because that is
+   *  what it can be drawn as.
+   *
+   *  Souls are the only repos that add optional kits (copia, pool, pan,
+   *  ravel). That is normal, not a fourth kind of repo, so those kits are
+   *  written on the row rather than splitting the group. */
+  type GroupKey = 'base' | 'soul' | 'other'
+  const GROUPS: { key: GroupKey; label: string; note: string }[] = [
+    { key: 'base', label: 'base only', note: 'markdown in git with only the base kit — every file drawn, coloured by folder' },
+    { key: 'soul', label: 'soul kit', note: 'the soul kit on top of base — journal, notes, pursuits' },
+    { key: 'other', label: 'other kit', note: 'a kit other than soul on top of base' },
   ]
+  function groupOf(r: RepoProbe): GroupKey {
+    const f = r.family
+    if (!f || f.family === 'plain') return 'base'
+    if (f.family === 'soul') return 'soul'
+    return f.kit === 'base' ? 'base' : 'other'
+  }
   let grouped = $derived(
-    GROUPS.map((g) => ({
-      ...g,
-      rows: repos.filter((r) => (r.family?.family ?? 'plain') === g.key),
-    })).filter((g) => g.rows.length > 0),
+    GROUPS.map((g) => ({ ...g, rows: repos.filter((r) => groupOf(r) === g.key) }))
+      .filter((g) => g.rows.length > 0),
   )
+
+  /** The text on the right of a row: the kits it adds beyond its group.
+   *
+   *  A soul row names its optional kits, not "soul", which the heading
+   *  already says. Ravel is left off: every soul on this machine carries it,
+   *  so naming it tells rows apart by nothing. It stays in the tooltip. */
+  function kitText(r: RepoProbe): string {
+    const g = groupOf(r)
+    if (g === 'other') return kitLabel(r.kit)
+    if (g === 'base') return ''
+    return r.optional_kits.map(kitLabel).filter((k) => k !== 'ravel').join(' · ')
+  }
+  function kitTitle(r: RepoProbe): string {
+    const all = [r.kit ?? 'no kit recorded', ...r.optional_kits]
+    return all.join('\n')
+  }
+
+  // Groups fold. What is folded is remembered per browser — a convenience,
+  // so a failure to store it only means everything opens expanded.
+  const FOLD_KEY = 'git-lex-ui.folded-groups'
+  function loadFolded(): Set<string> {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(FOLD_KEY) ?? '[]'))
+    } catch {
+      return new Set()
+    }
+  }
+  let folded = $state<Set<string>>(loadFolded())
+  function toggleGroup(key: string) {
+    const next = new Set(folded)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    folded = next
+    try { localStorage.setItem(FOLD_KEY, JSON.stringify([...next])) } catch { /* private window */ }
+  }
 
   /** Whether this row should offer a sync. Everything except a graph that is
    *  demonstrably current — including the states where we cannot tell, since
@@ -136,9 +181,13 @@
     <h2>repos <span class="n">{repos.length}</span></h2>
     <ul class="repos">
       {#each grouped as g (g.key)}
-        {#if grouped.length > 1}
-          <li class="grouphead" title={g.note}>{g.label} <span class="gn">{g.rows.length}</span></li>
-        {/if}
+        <li class="grouphead">
+          <button class="fold" title={g.note} aria-expanded={!folded.has(g.key)} onclick={() => toggleGroup(g.key)}>
+            <span class="caret">{folded.has(g.key) ? '\u25b8' : '\u25be'}</span>{g.label}
+            <span class="gn">{g.rows.length}</span>
+          </button>
+        </li>
+      {#if !folded.has(g.key)}
       {#each g.rows as r (r.path)}
         <li>
           <button
@@ -149,7 +198,7 @@
           >
             <span class="status {dot(r)}"></span>
             <span class="rname">{r.name}</span>
-            <span class="rkit">{kitLabel(r.kit)}</span>
+            <span class="rkit" title={kitTitle(r)}>{kitText(r)}</span>
             {#if stale(r)}
               {@const st = stale(r)!}
               <span class="rstale {st.cls}" title={st.title}>{st.mark}</span>
@@ -177,6 +226,7 @@
           {/if}
         </li>
       {/each}
+      {/if}
       {/each}
     </ul>
     <p class="foot">* ordered by last commit — the registry had no record of it being opened</p>
@@ -328,13 +378,17 @@
   /* Segments the list without competing with the rows. The count matters as
      much as the name: "markdown 1" says the base case is present and rare,
      which a bare heading would not. */
-  .grouphead {
+  .grouphead { border-bottom: 1px solid var(--rule); margin: 0.35rem 0 0.15rem; }
+  .grouphead:first-child { margin-top: 0; }
+  .fold {
+    display: flex; align-items: baseline; gap: 0.3rem; width: 100%;
+    border: none; background: none; padding: 0.15rem 0.3rem; text-align: left;
     font-size: 9px; letter-spacing: 0.09em; text-transform: uppercase;
-    color: var(--ink-faint); padding: 0.5rem 0.3rem 0.15rem;
-    border-bottom: 1px solid var(--rule); margin-bottom: 0.15rem;
+    color: var(--ink-faint);
   }
-  .grouphead:first-child { padding-top: 0.1rem; }
-  .gn { float: right; font-variant-numeric: tabular-nums; }
+  .fold:hover { background: none; color: var(--ink); }
+  .caret { width: 0.7rem; }
+  .gn { margin-left: auto; font-variant-numeric: tabular-nums; }
 
   .repo {
     display: grid;
