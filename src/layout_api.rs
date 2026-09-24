@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// tell. Halving the node sizes was exactly that: a change no key could see.
 /// A cache that cannot notice its own producer changed is the same defect as
 /// a figure that was correct when computed and wrong when read.
-const LAYOUT_VERSION: u32 = 5;
+const LAYOUT_VERSION: u32 = 6;
 
 pub struct Cached {
     pub meta_json: String,
@@ -228,20 +228,22 @@ async fn build_base(
         .arg(&sh)
         .output();
 
-    let (qo, qe, qlb, qa, qd, ql) = (
+    let (qo, qe, qlb, qa, qt, qd, ql) = (
         layout::q_ordinals(),
         layout::q_edges(),
         layout::q_link_born(),
         layout::q_alias(),
+        layout::q_types(),
         layout::q_dates(),
         layout::q_labels(),
     );
-    let (git, ords, edges, link_born, aliases, dates, labels) = tokio::join!(
+    let (git, ords, edges, link_born, aliases, types, dates, labels) = tokio::join!(
         git,
         c.query::<layout::OrdinalRow>(&qo),
         c.query::<layout::EdgeRow>(&qe),
         c.query::<layout::LinkBornRow>(&qlb),
         c.query::<layout::AliasRow>(&qa),
+        c.query::<layout::TypeRow>(&qt),
         c.query::<layout::DateRow>(&qd),
         c.query::<layout::LabelRow>(&ql),
     );
@@ -269,6 +271,9 @@ async fn build_base(
         edges.unwrap_or_default(),
         link_born.unwrap_or_default(),
         aliases.unwrap_or_default(),
+        // Missing types cost colour, not the picture: every file still draws,
+        // coloured by folder.
+        types.unwrap_or_default(),
         dates.unwrap_or_default(),
         labels.unwrap_or_default(),
         store_head,

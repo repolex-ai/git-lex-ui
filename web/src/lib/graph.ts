@@ -63,7 +63,9 @@ export interface Loaded {
   source: string
 }
 
-export async function loadLayout(genesis: string, reading: Reading): Promise<Loaded> {
+/** The one view the page draws. `base` on the wire because the server built
+ *  it by widening the base view; `typed` is still served for comparison. */
+export async function loadLayout(genesis: string, reading: Reading = 'base'): Promise<Loaded> {
   const mr = await fetch(`/api/layout/${genesis}?view=${reading}`)
   if (!mr.ok) throw new Error(await mr.text())
   const source = mr.headers.get('x-layout-source') ?? ''

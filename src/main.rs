@@ -653,13 +653,15 @@ struct ViewQuery {
     view: Option<String>,
 }
 
-/// `?view=base` or `?view=typed`; typed when absent, which is what every
-/// link made before the base view existed meant. An unknown value is an
+/// `?view=base` or `?view=typed`; base when absent. Base is the page's one
+/// view since 2026-09-24 — every markdown file, coloured by kit type where it
+/// has one and by folder where it does not. Typed stays servable so the two
+/// can still be compared. An unknown value is an
 /// error rather than a quiet default — a misspelt view drawing the other one
 /// would look like a correct answer.
 fn view_of(q: &ViewQuery) -> Result<layout::View, Response> {
     match q.view.as_deref() {
-        None => Ok(layout::View::Typed),
+        None => Ok(layout::View::Base),
         Some(v) => layout::View::parse(v).ok_or_else(|| {
             (StatusCode::BAD_REQUEST, format!("unknown view `{v}` — use base or typed")).into_response()
         }),

@@ -12,8 +12,6 @@
     edgeSubset: Uint32Array | null
     selected: number | null
     view: 'spiral' | 'neighbourhood'
-    /** Why the reading on screen is not the one that was asked for. */
-    readingNote: string | null
     centreOn: number | null
     onselect: (i: number | null) => void
     onready: (r: GraphRenderer) => void
@@ -23,7 +21,7 @@
   }
   let {
     meta, buffer, states, track, positions, edgeSubset,
-    selected, view, readingNote, centreOn, onselect, onready,
+    selected, view, centreOn, onselect, onready,
     syncState, onsync,
   }: Props = $props()
 
@@ -334,9 +332,8 @@
     {/if}
   </div>
 
-  {#if meta && (meta.dropped.length || meta.undated || readingNote || meta.view === 'base')}
+  {#if meta && (meta.dropped.length || meta.undated || meta.view === 'base')}
     <div class="disclose">
-      {#if readingNote}<span class="note">{readingNote}</span>{/if}
       {#if meta.view === 'base'}
         <span title="The base view draws markdown only. Files under .lex/ are git-lex's own machinery (kit copies, the compact ontology), not anybody's writing.">
           not drawn: <b>{meta.other_files}</b> other files{#if meta.machinery_files}, <b>{meta.machinery_files}</b> under .lex/{/if}
@@ -425,7 +422,6 @@
   }
   .disclose b { color: var(--ink-soft); }
   .pred { color: var(--ink-faint); }
-  .disclose .note { color: var(--warn); }
 
   .empty, .err {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;

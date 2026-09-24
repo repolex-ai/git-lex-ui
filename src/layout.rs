@@ -53,6 +53,21 @@ pub fn q_alias() -> String {
     )
 }
 
+/// The kit type of every file that has one, read through its Thing.
+///
+/// A type lives on the Thing and the Thing names its file with `gl:fileId`,
+/// which is complete on every soul measured (zero Things without a file,
+/// 2026-09-23). So one join colours a file by what a kit says it is, and a
+/// file no kit has typed simply does not come back — it keeps its folder.
+pub fn q_types() -> String {
+    format!(
+        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
+         SELECT ?file ?type WHERE {{
+             GRAPH <{NOW}> {{ ?thing gl:fileId ?file ; a ?type FILTER(?type != <{GL_FILE}>) }}
+         }}"
+    )
+}
+
 /// MIN(ordinal) over every fact ever asserted about a subject is the commit
 /// the document was born in. `ordinalDerived` is the ordering authority:
 /// author dates tie, and they lie under rebase.
@@ -478,6 +493,13 @@ pub struct AliasRow {
 }
 
 #[derive(serde::Deserialize)]
+pub struct TypeRow {
+    pub file: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct BornRow {
     pub s: String,
     pub born: String,
@@ -806,9 +828,9 @@ fn is_markdown(path: &str) -> bool {
 /// most wants to see. At most two folders can pass a third, so the legend
 /// stays short.
 const SPLIT_SHARE: f64 = 1.0 / 3.0;
-/// Folders past this many get one shared grey entry, so the palette is never
-/// reused for two different folders.
-const MAX_FOLDERS: usize = 11;
+/// Types and folders past this many, together, get a shared grey entry per
+/// kind, so the palette is never reused for two different entries.
+const MAX_NAMED: usize = 11;
 
 fn top(path: &str) -> &str {
     match path.find('/') {
@@ -836,6 +858,7 @@ pub fn build_base(
     edges: Vec<EdgeRow>,
     link_born_rows: Vec<LinkBornRow>,
     aliases: Vec<AliasRow>,
+    type_rows: Vec<TypeRow>,
     date_rows: Vec<DateRow>,
     label_rows: Vec<LabelRow>,
     store_head: Option<String>,
@@ -863,47 +886,6 @@ pub fn build_base(
         }
     }
 
-    // Folder for each path: the top folder, unless that folder is most of
-    // the repo, in which case its subfolders.
-    let mut top_counts: HashMap<&str, usize> = HashMap::new();
-    for p in &paths {
-        *top_counts.entry(top(p)).or_insert(0) += 1;
-    }
-    let split: HashSet<&str> = top_counts
-        .iter()
-        .filter(|(k, c)| !k.is_empty() && **c as f64 > paths.len() as f64 * SPLIT_SHARE)
-        .map(|(k, _)| *k)
-        .collect();
-    let folder_of = |p: &str| -> String {
-        let t = top(p);
-        if split.contains(t) { two_deep(p).to_string() } else { t.to_string() }
-    };
-
-    let mut folder_counts: HashMap<String, usize> = HashMap::new();
-    for p in &paths {
-        *folder_counts.entry(folder_of(p)).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(String, usize)> = folder_counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let named: HashSet<String> = ranked
-        .iter()
-        .filter(|(f, _)| !f.is_empty())
-        .take(MAX_FOLDERS)
-        .map(|(f, _)| f.clone())
-        .collect();
-    const ROOT: &str = "(top level)";
-    const REST: &str = "(other folders)";
-    let legend_key = |p: &str| -> String {
-        let f = folder_of(p);
-        if f.is_empty() {
-            ROOT.to_string()
-        } else if named.contains(&f) {
-            f
-        } else {
-            REST.to_string()
-        }
-    };
-
     // Titles, where a document declares one. The base view reads them but
     // never needs them: a file name is always there.
     let file_of_thing: HashMap<&str, &str> =
@@ -920,6 +902,90 @@ pub fn build_base(
             *e = (rank, r.label.clone());
         }
     }
+
+    // --- what colours each file ---------------------------------------------
+    //
+    // One view for every repo (goodlux, 2026-09-24). A file a kit has typed
+    // is coloured by its type; a file nothing has typed is coloured by its
+    // folder. A plain repo therefore draws exactly as the old base view did,
+    // and a soul draws its Notes and Journals as types with only the untyped
+    // remainder (Harness/, say) falling back to folders. Before this there
+    // were two views and you had to know which one had the picture in it.
+    //
+    // Where a file carries more than one type, the first in IRI order is
+    // taken, so the choice is the same on every load.
+    let mut type_of: HashMap<String, &str> = HashMap::new();
+    for r in &type_rows {
+        // File IRIs carry the path unencoded, the same form the ids below
+        // are built in (checked: no `%` in any W3BL0RD file IRI).
+        let rel = r.file.strip_prefix(FILE_PREFIX).unwrap_or(&r.file);
+        let e = type_of.entry(rel.to_string()).or_insert(r.ty.as_str());
+        if r.ty.as_str() < *e {
+            *e = r.ty.as_str();
+        }
+    }
+    let untyped: Vec<&str> = paths.iter().copied().filter(|p| !type_of.contains_key(*p)).collect();
+
+    // Folder for each untyped path: the top folder, unless that folder is
+    // most of what is left, in which case its subfolders. Measured over the
+    // untyped files only — on a soul, `Soul/` is typed away and `Harness/` is
+    // what remains to be told apart.
+    let mut top_counts: HashMap<&str, usize> = HashMap::new();
+    for p in &untyped {
+        *top_counts.entry(top(p)).or_insert(0) += 1;
+    }
+    let split: HashSet<&str> = top_counts
+        .iter()
+        .filter(|(k, c)| !k.is_empty() && **c as f64 > untyped.len() as f64 * SPLIT_SHARE)
+        .map(|(k, _)| *k)
+        .collect();
+    let folder_of = |p: &str| -> String {
+        let t = top(p);
+        if split.contains(t) { two_deep(p).to_string() } else { t.to_string() }
+    };
+
+    // Types and folders share one palette. Types come first because a type is
+    // something someone declared and a folder is only where a file sits.
+    // Past MAX_NAMED the tail shares a grey entry per kind, so no two entries
+    // ever quietly share a hue.
+    let mut type_counts: HashMap<&str, usize> = HashMap::new();
+    for t in type_of.values() {
+        *type_counts.entry(*t).or_insert(0) += 1;
+    }
+    let mut folder_counts: HashMap<String, usize> = HashMap::new();
+    for p in &untyped {
+        *folder_counts.entry(folder_of(p)).or_insert(0) += 1;
+    }
+    let mut types_ranked: Vec<(String, usize)> =
+        type_counts.into_iter().map(|(k, c)| (k.to_string(), c)).collect();
+    types_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut folders_ranked: Vec<(String, usize)> =
+        folder_counts.into_iter().filter(|(f, _)| !f.is_empty()).collect();
+    folders_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let named_types: HashSet<String> =
+        types_ranked.iter().take(MAX_NAMED).map(|(k, _)| k.clone()).collect();
+    let named_folders: HashSet<String> = folders_ranked
+        .iter()
+        .take(MAX_NAMED.saturating_sub(named_types.len()))
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    const ROOT: &str = "(top level)";
+    const REST: &str = "(other folders)";
+    const REST_TYPES: &str = "(other types)";
+    let legend_key = |p: &str| -> String {
+        if let Some(t) = type_of.get(p) {
+            return if named_types.contains(*t) { t.to_string() } else { REST_TYPES.to_string() };
+        }
+        let f = folder_of(p);
+        if f.is_empty() {
+            ROOT.to_string()
+        } else if named_folders.contains(&f) {
+            f
+        } else {
+            REST.to_string()
+        }
+    };
 
     let docs: Vec<Placed> = paths
         .iter()
@@ -943,12 +1009,15 @@ pub fn build_base(
         *counts.entry(d.group.as_str()).or_insert(0) += 1;
     }
     let mut order: Vec<(&str, usize)> = counts.into_iter().collect();
-    // Real folders first by size; the top level and the catch-all go last,
-    // in grey, because neither is a place anyone chose.
+    // Types first, then real folders, each by size; the top level and the
+    // two catch-alls go last, in grey, because none of them is a place or a
+    // kind anyone chose.
     let rank = |k: &str| match k {
-        ROOT => 1,
-        REST => 2,
-        _ => 0,
+        _ if named_types.contains(k) => 0,
+        ROOT => 2,
+        REST_TYPES => 3,
+        REST => 4,
+        _ => 1,
     };
     order.sort_by(|a, b| rank(a.0).cmp(&rank(b.0)).then(b.1.cmp(&a.1)).then(a.0.cmp(b.0)));
     let classes: Vec<ClassInfo> = order
@@ -956,11 +1025,15 @@ pub fn build_base(
         .enumerate()
         .map(|(i, (k, c))| ClassInfo {
             uri: k.to_string(),
-            name: if rank(k) == 0 { format!("{k}/") } else { k.to_string() },
+            name: match rank(k) {
+                0 => short_name(k),
+                1 => format!("{k}/"),
+                _ => k.to_string(),
+            },
             count: *c,
             color: match rank(k) {
-                0 => color_for(i),
-                1 => "#8d8d93".to_string(),
+                0 | 1 => color_for(i),
+                2 => "#8d8d93".to_string(),
                 _ => "#c4c4c9".to_string(),
             },
         })
@@ -1574,7 +1647,7 @@ mod tests {
         let ords = (0..paths.len())
             .map(|i| OrdinalRow { id: format!("c{i}"), ord: (i + 1).to_string() })
             .collect();
-        build_base("g", "h", tree(paths), &history, ords, vec![], vec![], vec![], vec![], vec![], None, None)
+        build_base("g", "h", tree(paths), &history, ords, vec![], vec![], vec![], vec![], vec![], vec![], None, None)
     }
 
     /// The base case: markdown with no frontmatter, no kit and no links still
@@ -1624,11 +1697,47 @@ mod tests {
         let paths: Vec<String> = (0..15).map(|i| format!("f{i:02}/doc.md")).collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let l = base(&refs);
-        assert_eq!(l.meta.classes.len(), MAX_FOLDERS + 1);
+        assert_eq!(l.meta.classes.len(), MAX_NAMED + 1);
         let rest = l.meta.classes.last().unwrap();
         assert_eq!((rest.name.as_str(), rest.count), ("(other folders)", 4));
         let colours: HashSet<&str> =
-            l.meta.classes[..MAX_FOLDERS].iter().map(|c| c.color.as_str()).collect();
-        assert_eq!(colours.len(), MAX_FOLDERS, "two named folders share a colour");
+            l.meta.classes[..MAX_NAMED].iter().map(|c| c.color.as_str()).collect();
+        assert_eq!(colours.len(), MAX_NAMED, "two named folders share a colour");
+    }
+
+    /// One view: a typed file is coloured by its type, an untyped one by its
+    /// folder, and the folder split is measured over the untyped files alone.
+    #[test]
+    fn a_typed_file_takes_its_type_and_the_rest_keep_their_folder() {
+        let paths = [
+            "Soul/Note/a.md", "Soul/Note/b.md", "Soul/Journal/c.md",
+            "Harness/Memory/m1.md", "Harness/Memory/m2.md", "Harness/x.md", "README.md",
+        ];
+        let mut history = HashMap::new();
+        for (i, p) in paths.iter().enumerate() {
+            history.insert(p.to_string(), PathHistory { first_sha: format!("c{i}"), commits: 1 });
+        }
+        let ords = (0..paths.len())
+            .map(|i| OrdinalRow { id: format!("c{i}"), ord: (i + 1).to_string() })
+            .collect();
+        let ty = |f: &str, t: &str| TypeRow {
+            file: format!("{FILE_PREFIX}{f}"),
+            ty: format!("https://repolex.ai/ontology/soul/{t}"),
+        };
+        let types = vec![
+            ty("Soul/Note/a.md", "Note"),
+            ty("Soul/Note/b.md", "Note"),
+            ty("Soul/Journal/c.md", "Journal"),
+        ];
+        let l = build_base(
+            "g", "h", tree(&paths), &history, ords,
+            vec![], vec![], vec![], types, vec![], vec![], None, None,
+        );
+        assert_eq!(l.meta.node_count, 7, "typing a file must never drop it");
+        let names: Vec<&str> = l.meta.classes.iter().map(|c| c.name.as_str()).collect();
+        // Harness/ is 3 of the 4 untyped files, so it splits one level down.
+        assert_eq!(names, ["Note", "Journal", "Harness/Memory/", "Harness/", "(top level)"]);
+        let colours: HashSet<&str> = l.meta.classes[..4].iter().map(|c| c.color.as_str()).collect();
+        assert_eq!(colours.len(), 4, "a type and a folder share a colour");
     }
 }
