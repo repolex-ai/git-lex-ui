@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { LayoutMeta, DocMeta, Adjacency } from './graph'
   import { triplesFor, curie, shortUri, type Triple } from './triples'
+  import type { FileText } from './types'
+  import DocPanel from './DocPanel.svelte'
 
   interface Props {
     genesis: string | null
@@ -8,8 +10,29 @@
     adj: Adjacency | null
     selected: number | null
     onselect: (i: number) => void
+    docFile: FileText | null
+    docLoading: boolean
   }
-  let { genesis, meta, adj, selected, onselect }: Props = $props()
+  let { genesis, meta, adj, selected, onselect, docFile, docLoading }: Props = $props()
+
+  // Two tabs in one fixed place: the document you are reading, and what the
+  // graph knows about it. Which one is showing survives clicking from node to
+  // node, so following links while reading keeps you reading. It is
+  // remembered per browser as a convenience; losing it costs one click.
+  type Tab = 'document' | 'info'
+  const TAB_KEY = 'git-lex-ui.inspector-tab'
+  function savedTab(): Tab {
+    try {
+      return localStorage.getItem(TAB_KEY) === 'info' ? 'info' : 'document'
+    } catch {
+      return 'document'
+    }
+  }
+  let tab = $state<Tab>(savedTab())
+  function setTab(t: Tab) {
+    tab = t
+    try { localStorage.setItem(TAB_KEY, t) } catch { /* private window */ }
+  }
 
   let rows = $state<{
     subjects: string[]
@@ -99,6 +122,24 @@
     {/if}
   </section>
 
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected={tab === 'document'} class:on={tab === 'document'} onclick={() => setTab('document')}>document</button>
+    <button role="tab" aria-selected={tab === 'info'} class:on={tab === 'info'} onclick={() => setTab('info')}>
+      links &amp; triples
+      {#if doc}<span class="n">{outLinks.length + inLinks.length}</span>{/if}
+    </button>
+  </div>
+
+  {#if tab === 'document'}
+  <div class="pane">
+    {#if doc}
+      <DocPanel file={docFile} loading={docLoading} />
+    {:else}
+      <p class="empty pad">click a node on the stage to read it here</p>
+    {/if}
+  </div>
+  {:else}
+  <div class="pane scroll">
   <section class="block links">
     <h2>links out <span class="n">{outLinks.length}</span></h2>
     {#if outLinks.length}
@@ -173,6 +214,8 @@
       <p class="empty">nothing selected</p>
     {/if}
   </section>
+  </div>
+  {/if}
 </aside>
 
 <style>
@@ -186,8 +229,22 @@
     background: var(--paper);
   }
   .block { border-bottom: 1px solid var(--rule); padding: 0.6rem 0.7rem; }
-  .links { max-height: 26vh; overflow-y: auto; }
-  .triples { flex: 1; overflow-y: auto; min-height: 0; }
+  .block:last-child { border-bottom: none; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--rule); }
+  .tabs button {
+    flex: 1; border: none; background: none; border-radius: 0;
+    padding: 0.4rem 0.5rem; font-family: var(--mono); font-size: 10px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint);
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    display: flex; gap: 0.4rem; justify-content: center;
+  }
+  .tabs button:hover { color: var(--ink); background: none; }
+  .tabs button.on { color: var(--ink); border-bottom-color: var(--ink); }
+
+  .pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .pane.scroll { overflow-y: auto; display: block; }
+  .pad { padding: 0.6rem 0.7rem; }
 
   h2 {
     font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;

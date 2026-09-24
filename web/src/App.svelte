@@ -28,15 +28,12 @@
   let search = $state('')
   let selected = $state<number | null>(null)
 
-  // --- the document panel -------------------------------------------------
+  // --- the document ---------------------------------------------------------
   //
-  // Floats over the stage rather than living in the inspector, matching
-  // the old viewer's behaviour, where a document is something you open on top
-  // of the graph and dismiss, not a section competing with the triples for
-  // room in a 18rem rail.
+  // Read into the right rail's document tab. It used to float over the stage,
+  // which put the prose on top of the graph it was opened from.
   let docFile = $state<FileText | null>(null)
   let docLoading = $state(false)
-  let docOpen = $state(false)
 
   /** The repo-relative path a File IRI carries.
    *
@@ -54,12 +51,10 @@
     const rel = d ? pathOf(d.id) : null
     if (!g || !rel) {
       docFile = null
-      docOpen = false
       return
     }
     let cancelled = false
     docLoading = true
-    docOpen = true
     api.file(g, rel).then((f) => {
       if (!cancelled) {
         docFile = f
@@ -458,10 +453,6 @@
     {centreOn}
     onselect={select}
     onready={onReady}
-    {docOpen}
-    {docFile}
-    {docLoading}
-    ondocclose={() => (docOpen = false)}
     syncState={current ? (syncs[current.path] ?? null) : null}
     onsync={() => current && startSync(current)}
   />
@@ -472,6 +463,8 @@
     {adj}
     {selected}
     onselect={selectAndCentre}
+    {docFile}
+    {docLoading}
   />
 </div>
 
@@ -481,7 +474,7 @@
      changes — a control you have to re-find is a control you stop using. */
   .app {
     display: grid;
-    grid-template-columns: 15rem 1fr 18rem;
+    grid-template-columns: 15rem 1fr 26rem;
     grid-template-rows: auto 1fr;
     grid-template-areas:
       "top   top   top"

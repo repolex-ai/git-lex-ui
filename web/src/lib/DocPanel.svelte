@@ -3,12 +3,10 @@
   import type { FileText } from './types'
 
   interface Props {
-    title: string
     file: FileText | null
     loading: boolean
-    onclose: () => void
   }
-  let { title, file, loading, onclose }: Props = $props()
+  let { file, loading }: Props = $props()
 
   /** Strip the YAML frontmatter block.
    *
@@ -49,12 +47,10 @@
   const html = $derived(file?.text ? render(file.text) : null)
 </script>
 
-<aside class="panel">
-  <header>
-    <h3 title={title}>{title}</h3>
-    {#if file?.text}<span class="size">{(file.bytes / 1024).toFixed(1)}k</span>{/if}
-    <button class="close" onclick={onclose} aria-label="Close">×</button>
-  </header>
+<div class="panel">
+  {#if file?.text}
+    <div class="where"><span class="path" title={file.path}>{file.path}</span><span class="size">{(file.bytes / 1024).toFixed(1)}k</span></div>
+  {/if}
   <div class="body">
     {#if loading}
       <p class="note">reading…</p>
@@ -69,72 +65,34 @@
       <p class="note">no document for this node</p>
     {/if}
   </div>
-</aside>
+</div>
 
 <style>
-  /* Floats over the stage rather than living in a rail, matching the old
-     viewer's markdown panel — the graph stays the whole surface and the
-     document is something you open on top of it and dismiss. Left-anchored
-     so it never covers the inspector on the right. */
+  /* Lives in a tab of the right rail. It used to float over the stage and
+     covered the graph it was opened from (goodlux, 2026-09-24: the document
+     and the graph should both stay in view), so the rail now holds it and
+     the stage keeps its whole surface. */
   .panel {
-    position: absolute;
-    left: 0.75rem;
-    top: 2.6rem;
-    bottom: 0.75rem;
-    width: min(30rem, 42%);
     display: flex;
     flex-direction: column;
-    /* Translucent, so the graph stays visible behind the document you
-       opened from it. The blur is what makes that readable rather than
-       noisy: without it, edge lines run straight through the text at full
-       contrast and the prose becomes hard work. */
-    background: color-mix(in srgb, var(--paper) 88%, transparent);
-    backdrop-filter: blur(7px) saturate(0.9);
-    -webkit-backdrop-filter: blur(7px) saturate(0.9);
-    border: 1px solid var(--ink);
-    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.09);
-    z-index: 5;
+    min-height: 0;
+    height: 100%;
   }
-
-  header {
+  .where {
     display: flex;
-    align-items: baseline;
     gap: 0.5rem;
-    padding: 0.4rem 0.5rem;
-    border-bottom: 1px solid var(--rule);
-    /* The header stays more solid than the body: it carries the title and
-       the close button, which should never be competing with a graph edge. */
-    background: color-mix(in srgb, var(--paper-tint) 94%, transparent);
-  }
-  h3 {
-    margin: 0;
-    font-family: var(--display);
-    font-size: 13px;
-    font-weight: normal;
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .size {
+    align-items: baseline;
+    padding: 0.35rem 0.7rem;
+    border-bottom: 1px solid var(--paper-tint);
     font-size: 10px;
     color: var(--ink-faint);
-    font-variant-numeric: tabular-nums;
   }
-  .close {
-    border: none;
-    background: none;
-    font-size: 16px;
-    line-height: 1;
-    padding: 0 0.15rem;
-    cursor: pointer;
-    color: var(--ink-faint);
-  }
-  .close:hover {
-    color: var(--ink);
-  }
+  .path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .size { font-variant-numeric: tabular-nums; }
 
   .body {
+    flex: 1;
+    min-height: 0;
     overflow: auto;
     padding: 0.7rem 0.9rem 1.2rem;
   }

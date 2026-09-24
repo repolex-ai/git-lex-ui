@@ -1,8 +1,7 @@
 <script lang="ts">
   import { GraphRenderer, NodeState, type View } from './renderer'
   import type { LayoutMeta, DocMeta } from './graph'
-  import DocPanel from './DocPanel.svelte'
-  import type { FileText, SyncState } from './types'
+  import type { SyncState } from './types'
 
   interface Props {
     meta: LayoutMeta | null
@@ -18,22 +17,14 @@
     centreOn: number | null
     onselect: (i: number | null) => void
     onready: (r: GraphRenderer) => void
-    /** The document panel floats over the canvas, so it is rendered here
-     *  rather than by the app shell — `.canvas-wrap` is the positioned
-     *  ancestor it anchors to, and a sibling of the stage would have become
-     *  a fourth column in the app's three-column grid. */
     /** Sync state for the open soul, and how to start one. */
     syncState: SyncState | null
     onsync: () => void
-    docOpen: boolean
-    docFile: FileText | null
-    docLoading: boolean
-    ondocclose: () => void
   }
   let {
     meta, buffer, states, track, positions, edgeSubset,
     selected, view, readingNote, centreOn, onselect, onready,
-    docOpen, docFile, docLoading, ondocclose, syncState, onsync,
+    syncState, onsync,
   }: Props = $props()
 
   let canvas = $state<HTMLCanvasElement | null>(null)
@@ -334,15 +325,6 @@
       onpointermove={onMove}
       onpointerleave={() => (hover = null)}
     ></canvas>
-
-    {#if docOpen && meta && selected !== null}
-      <DocPanel
-        title={meta.docs[selected].label}
-        file={docFile}
-        loading={docLoading}
-        onclose={ondocclose}
-      />
-    {/if}
 
     {#if hover && meta}
       <div class="tip" style="left:{hover.x + 14}px; top:{hover.y + 14}px">
