@@ -198,6 +198,34 @@
         reading = 'base'
         readingNote = `Showing the base view — the types view is not available: ${e instanceof Error ? e.message : String(e)}`
       }
+
+      // A kit installed is not the same as documents typed.
+      //
+      // `defaultReading` picks typed for any repo with a kit, and installing
+      // a kit is the first thing `git lex init` does — so a brand new corpus
+      // of ordinary markdown is called "kitted" before a single document has
+      // a type. The typed reading of such a repo does not fail, which is why
+      // the catch above never fires for it: it succeeds and draws every file
+      // it can see as an untyped "File only" dot. Measured on a 21-document
+      // corpus, 2026-09-23: typed drew 10 grey dots in one group, base drew
+      // all 21 coloured by folder. The better picture lost to the emptier one
+      // because of a flag set by an install.
+      //
+      // So the default is decided by what the reading actually contains
+      // rather than by what the repo has installed. Only chosen defaults are
+      // overridden — an explicit ?reading= or a click on the switch is a
+      // request, and requests are honoured even when they are worse.
+      const chosen = want ?? readingFromUrl()
+      if (!chosen && reading === 'typed' && !l.meta.classes.some((c) => c.name !== 'File only')) {
+        const base = await loadLayout(repo.genesis_sha!, 'base')
+        if (base.meta.node_count > l.meta.node_count) {
+          l = base
+          reading = 'base'
+          readingNote =
+            'Showing the base view — nothing in this repo has been given a type yet, ' +
+            'so the types view has only files in it.'
+        }
+      }
       meta = l.meta
       buffer = l.buffer
       adj = new Adjacency(l.meta.node_count, new Uint32Array(

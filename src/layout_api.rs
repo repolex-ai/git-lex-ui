@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// tell. Halving the node sizes was exactly that: a change no key could see.
 /// A cache that cannot notice its own producer changed is the same defect as
 /// a figure that was correct when computed and wrong when read.
-const LAYOUT_VERSION: u32 = 4;
+const LAYOUT_VERSION: u32 = 5;
 
 pub struct Cached {
     pub meta_json: String,

@@ -555,6 +555,29 @@ fn turns_for(n: usize) -> u32 {
     (((n as f64) / 900.0).ceil() as u32).clamp(2, 7)
 }
 
+/// Scale dots up on a sparse spiral, and never down on a crowded one.
+///
+/// Dot size was tuned by @goodlux on 2026-09-04 against a soul of a couple of
+/// hundred documents, where the complaint was that dots read as blobs. The
+/// number that came out of that is right for that density and only that
+/// density: the spiral fills the view whatever it holds, so a repo with a
+/// fifth of the documents gets a fifth of the neighbours, and the same dots
+/// read as dust. Measured on a 21-document corpus, 2026-09-23 — the size of
+/// corpus someone brings to git-lex on their first day.
+///
+/// `REFERENCE` is documents-per-turn at the density that tuning was done at,
+/// so the scale is exactly 1.0 there and for everything denser: no existing
+/// soul changes. Sparse repos open up, by at most `MAX`, which stops a
+/// five-document repo drawing five balloons.
+fn density_scale(n: usize, turns: u32) -> f32 {
+    const REFERENCE: f32 = 90.0;
+    const MAX: f32 = 2.5;
+    if n == 0 || turns == 0 {
+        return 1.0;
+    }
+    (REFERENCE / (n as f32 / turns as f32)).sqrt().clamp(1.0, MAX)
+}
+
 /// A readable spread of hues. Strided rather than walked, because
 /// consecutive entries landed on near-identical blues and a legend you
 /// cannot read is a legend that lies.
@@ -1035,6 +1058,7 @@ fn place_and_pack(
 
     let n = docs.len();
     let turns = turns_for(n);
+    let dscale = density_scale(n, turns);
     let mut positions = vec![0f32; n * 2];
     let mut colors = vec![0u8; n * 3];
     let mut sizes = vec![0f32; n];
@@ -1086,12 +1110,13 @@ fn place_and_pack(
         colors[i * 3 + 2] = rgb[2];
 
         // Size is how many times the document changed, compressed so a
-        // 300-event document does not swallow its neighbours.
-        // Halved from 3.2 on 2026-09-04 at @goodlux's request, and at
-        // a view that now fits the window they were reading as blobs rather
-        // than as points on a track. See LAYOUT_VERSION in layout_api.rs:
-        // the cache is keyed by HEAD, which cannot see a change to this line.
-        sizes[i] = 1.6 * (1.0 + (d.events as f32 + 1.0).log2() * 0.28);
+        // 300-event document does not swallow its neighbours, then opened up
+        // by however much empty track this repo has. See `density_scale`:
+        // the 2026-09-04 tuning was done on a dense soul and quietly assumed
+        // every repo would be dense. See also LAYOUT_VERSION in
+        // layout_api.rs — the cache is keyed by HEAD, which cannot see a
+        // change to this line.
+        sizes[i] = 1.6 * dscale * (1.0 + (d.events as f32 + 1.0).log2() * 0.28);
     }
 
     // --- edges ------------------------------------------------------------
@@ -1343,6 +1368,34 @@ fn place_and_pack(
 
 #[cfg(test)]
 mod tests {
+    /// The tuning @goodlux did on a dense soul must survive untouched. A repo
+    /// at or above that density gets exactly the size it got before.
+    #[test]
+    fn a_crowded_spiral_keeps_the_size_it_was_tuned_to() {
+        assert_eq!(super::density_scale(180, 2), 1.0);
+        assert_eq!(super::density_scale(13_000, 7), 1.0);
+    }
+
+    /// The case this exists for: a first-day corpus, where the same dots on
+    /// the same spiral have a fraction of the neighbours and read as dust.
+    #[test]
+    fn a_sparse_spiral_opens_its_dots_up() {
+        let s = super::density_scale(21, 2);
+        assert!(s > 1.0, "a 21-document repo must not draw at dense-soul size");
+        assert!(s <= 2.5, "and must not draw balloons either, got {s}");
+    }
+
+    /// Bounded at both ends. A near-empty repo is the easiest way to get a
+    /// divide-by-something-tiny and a screenful of circles.
+    #[test]
+    fn the_scale_is_bounded_however_empty_the_repo_is() {
+        for n in [0usize, 1, 2, 5] {
+            let s = super::density_scale(n, 2);
+            assert!((1.0..=2.5).contains(&s), "n={n} gave {s}");
+        }
+        assert_eq!(super::density_scale(10, 0), 1.0, "turns of zero must not divide");
+    }
+
     use super::*;
 
     fn rows<T: serde::de::DeserializeOwned>(dir: &str, name: &str) -> Vec<T> {
