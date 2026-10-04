@@ -59,19 +59,13 @@ Vite serves the UI on `http://localhost:5173` and automatically proxies `/api` a
 
 ---
 
-## The Two Readings of a Repo
+## What It Draws
 
-`git-lex-ui` offers two distinct readings of any repository, switchable via `?view=base|typed`:
+`git-lex-ui` draws one view of any repository:
 
-### 1. Base (`?view=base`)
-* **What it draws:** Every markdown file in the repository, positioned at the commit git records it first appearing in, sized by its commit frequency, and colored by directory tree.
-* **Requirements:** None. Works on **any git repository** holding markdown files—no kit installation, no YAML frontmatter, and no RDF ontologies required.
-* **Why it matters:** git-lex's foundational substrate is plain markdown in git. This reading visualizes the physical document landscape as it actually evolved.
-
-### 2. Typed (`?view=typed`)
-* **What it draws:** High-level entities from the store's current `now` view, colored by their ontology class (`soul:Journal`, `soul:Note`, `copia:Texture`, etc.).
-* **Requirements:** Requires a kit to have typed documents and an executed sync.
-* **Fallback behavior:** Plain repositories open in base view automatically. Kitted repositories default to typed view, falling back to base view with an explanatory note if the store holds no typed entities.
+* **Every markdown file**, positioned at the commit git records it first appearing in, and sized by how often it changed.
+* **Coloured by kit type where a file has one** (`soul:Journal`, `soul:Note`, `copia:Texture`, etc.), and by folder where it does not.
+* **No requirements beyond a sync.** A plain repository with no kit, no YAML frontmatter and no ontology still draws, coloured entirely by folder.
 
 ---
 

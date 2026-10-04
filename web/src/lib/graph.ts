@@ -18,14 +18,7 @@ export interface Dropped {
   by_predicate?: [string, number][]
 }
 
-/** Which reading of a repo a layout is. `base` is every markdown file by
- *  folder, dated by git, and works for any repo; `typed` is documents from
- *  the store's `now` view, coloured by type, and needs a kit to have typed
- *  something. */
-export type Reading = 'base' | 'typed'
-
 export interface LayoutMeta {
-  view: Reading
   genesis_sha: string
   head_sha: string
   store_head: string | null
@@ -45,11 +38,8 @@ export interface LayoutMeta {
   links_undated: number
   first_ordinal: number | null
   last_ordinal: number | null
-  file_subjects: number
-  folded_files: number
-  unbridged_things: number
-  /** Base reading only: tracked files that are not markdown, and markdown
-   *  under `.lex/`. Neither is drawn; both are counted. */
+  /** Tracked files that are not markdown, and markdown under `.lex/`.
+   *  Neither is drawn; both are counted. */
   other_files: number
   machinery_files: number
   titled: number
@@ -63,14 +53,14 @@ export interface Loaded {
   source: string
 }
 
-/** The one view the page draws. `base` on the wire because the server built
- *  it by widening the base view; `typed` is still served for comparison. */
-export async function loadLayout(genesis: string, reading: Reading = 'base'): Promise<Loaded> {
-  const mr = await fetch(`/api/layout/${genesis}?view=${reading}`)
+/** The one view the page draws: every markdown file, coloured by kit type
+ *  where it has one and by folder where it does not. */
+export async function loadLayout(genesis: string): Promise<Loaded> {
+  const mr = await fetch(`/api/layout/${genesis}`)
   if (!mr.ok) throw new Error(await mr.text())
   const source = mr.headers.get('x-layout-source') ?? ''
   const meta: LayoutMeta = await mr.json()
-  const dr = await fetch(`/api/layout/${genesis}/data?view=${reading}`)
+  const dr = await fetch(`/api/layout/${genesis}/data`)
   if (!dr.ok) throw new Error(await dr.text())
   return { meta, buffer: await dr.arrayBuffer(), source }
 }

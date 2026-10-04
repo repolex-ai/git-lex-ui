@@ -1,10 +1,10 @@
 //! The whole-repo spiral layout, computed server-side.
 //!
-//! Two readings share it (see [`View`]): **base**, every markdown file by
-//! folder and dated by git, which works for any repo; and **typed**,
-//! documents the kit has typed, coloured by type. They differ only in which
-//! documents they collect and how they group them — `place_and_pack` below is
-//! the one piece that draws both.
+//! One view for every repo: every markdown file, dated by git, coloured by
+//! its kit type where it has one and by its folder where it does not. There
+//! used to be a second, typed-only view built from the store's `now` view;
+//! it was removed on 2026-10-04 (goodlux), since the one view draws
+//! everything it drew.
 //!
 //! A document's position is **when it first appeared**, drawn as a spiral:
 //! centre is the first commit, rim is now, one turn is one slice of the
@@ -68,21 +68,6 @@ pub fn q_types() -> String {
     )
 }
 
-/// MIN(ordinal) over every fact ever asserted about a subject is the commit
-/// the document was born in. `ordinalDerived` is the ordering authority:
-/// author dates tie, and they lie under rebase.
-pub fn q_born() -> String {
-    format!(
-        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
-         PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
-         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-         SELECT ?s (MIN(?ord) AS ?born) (COUNT(?e) AS ?events) WHERE {{
-             GRAPH <{ONE_GRAPH}> {{ ?e rdf:reifies <<( ?s ?p ?o )>> ; gl:assertedIn ?c }}
-             GRAPH <{COMMITS}> {{ ?c g2:ordinalDerived ?ord }}
-         }} GROUP BY ?s"
-    )
-}
-
 /// The newest commit the STORE knows about.
 ///
 /// This is not the repo's HEAD, and the gap between them is the single most
@@ -103,23 +88,6 @@ pub fn q_store_head() -> String {
          SELECT ?id ?ord WHERE {{
              GRAPH <{COMMITS}> {{ ?c g2:ordinalDerived ?ord ; g2:id ?id }}
          }} ORDER BY DESC(xsd:integer(?ord)) LIMIT 1"
-    )
-}
-
-/// Every typed subject in the now view, with a display label.
-///
-/// Includes orphans that nothing links to — a document nobody linked is
-/// still a document, and dropping it would quietly shrink the census.
-pub fn q_nodes() -> String {
-    format!(
-        "PREFIX gl: <https://repolex.ai/ontology/git-lex/>
-         SELECT ?id ?type ?label WHERE {{
-             GRAPH <{NOW}> {{
-                 ?id a ?type .
-                 OPTIONAL {{ ?id gl:name ?n }}
-                 BIND(COALESCE(?n, REPLACE(STR(?id), \"^.*/\", \"\")) AS ?label)
-             }}
-         }}"
     )
 }
 
@@ -326,43 +294,8 @@ pub struct Dropped {
     pub by_predicate: Vec<(String, usize)>,
 }
 
-/// Which reading of a repo a layout is.
-///
-/// **Base** works for any git-lex repo, kit or no kit: every markdown file
-/// the store's file tree lists, placed by the commit git says it first
-/// appeared in, coloured by folder. It needs nothing from frontmatter, which
-/// is the point — git-lex's base case is a folder of markdown files, and a
-/// view that only draws typed documents draws nothing for that case. Decided
-/// with @goodlux on 2026-09-17, as the layer every kit view sits on top of.
-///
-/// **Typed** is the original view: documents from the store's `now` view,
-/// coloured by class. It needs a kit to have typed something.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum View {
-    Base,
-    Typed,
-}
-
-impl View {
-    pub fn parse(s: &str) -> Option<View> {
-        match s {
-            "base" => Some(View::Base),
-            "typed" => Some(View::Typed),
-            _ => None,
-        }
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            View::Base => "base",
-            View::Typed => "typed",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct LayoutMeta {
-    pub view: View,
     pub genesis_sha: String,
     /// The repo's HEAD, read from git at request time.
     pub head_sha: String,
@@ -402,22 +335,10 @@ pub struct LayoutMeta {
     /// documents.
     pub first_ordinal: Option<i64>,
     pub last_ordinal: Option<i64>,
-    /// Subjects typed `gl:File` in the store, before folding.
-    pub file_subjects: usize,
-    /// Files that carry a Thing, and so are drawn as that Thing rather than
-    /// as a file. `file_subjects - folded_files` is the number of documents
-    /// that are *only* a file — which is what the File entry in `classes`
-    /// counts, and why that number is smaller than the store's file count.
-    /// Two true numbers under one label is how a reader gets stuck, so both
-    /// are carried and the page states the relation.
-    pub folded_files: usize,
-    /// Things whose `gl:fileId` names a file that is not itself in the node
-    /// set. They are still drawn, under their own class.
-    pub unbridged_things: usize,
-    /// Base view only: files in the tree that are not markdown, and so are
+    /// Files in the tree that are not markdown, and so are
     /// not drawn. Counted so a code repo does not read as a tiny one.
     pub other_files: usize,
-    /// Base view only: markdown under `.lex/`, which is git-lex's own
+    /// Markdown under `.lex/`, which is git-lex's own
     /// machinery (kit copies, the compact ontology) rather than anybody's
     /// writing. Left out of the picture, and counted.
     pub machinery_files: usize,
@@ -461,15 +382,6 @@ pub struct Layout {
 
 /// Rows as the child server returns them.
 #[derive(serde::Deserialize)]
-pub struct NodeRow {
-    pub id: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(rename = "type")]
-    pub ty: String,
-}
-
-#[derive(serde::Deserialize)]
 pub struct EdgeRow {
     pub from: String,
     pub target: String,
@@ -497,13 +409,6 @@ pub struct TypeRow {
     pub file: String,
     #[serde(rename = "type")]
     pub ty: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct BornRow {
-    pub s: String,
-    pub born: String,
-    pub events: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -625,192 +530,6 @@ fn hash01(s: &str) -> f32 {
         h = h.wrapping_mul(16777619);
     }
     (h as f64 / u32::MAX as f64) as f32
-}
-
-pub fn build(
-    genesis_sha: &str,
-    head_sha: &str,
-    nodes: Vec<NodeRow>,
-    edges: Vec<EdgeRow>,
-    link_born_rows: Vec<LinkBornRow>,
-    aliases: Vec<AliasRow>,
-    born_rows: Vec<BornRow>,
-    date_rows: Vec<DateRow>,
-    label_rows: Vec<LabelRow>,
-    store_head: Option<String>,
-    commits_behind: Option<usize>,
-) -> Layout {
-    // Best title per subject: lowest rank wins, so a declared Thing-plane
-    // name beats a file-plane one.
-    let mut best_label: HashMap<&str, (u8, &str)> = HashMap::new();
-    for r in &label_rows {
-        let rank: u8 = r.rank.parse().unwrap_or(9);
-        let e = best_label.entry(r.s.as_str()).or_insert((rank, r.label.as_str()));
-        if rank < e.0 {
-            *e = (rank, r.label.as_str());
-        }
-    }
-    // --- fold the Thing plane onto the File plane -------------------------
-    let file_of_thing: HashMap<&str, &str> = aliases
-        .iter()
-        .map(|a| (a.thing.as_str(), a.file.as_str()))
-        .collect();
-    let fold = |id: &str| -> String {
-        file_of_thing.get(id).map(|s| s.to_string()).unwrap_or_else(|| id.to_string())
-    };
-
-    let mut born_of: HashMap<&str, i64> = HashMap::new();
-    let mut events_of: HashMap<&str, u32> = HashMap::new();
-    for r in &born_rows {
-        if let Ok(b) = r.born.parse::<i64>() {
-            born_of.insert(r.s.as_str(), b);
-        }
-        events_of.insert(r.s.as_str(), r.events.parse().unwrap_or(0));
-    }
-
-    struct Agg {
-        id: String,
-        types: Vec<String>,
-        labels: HashMap<String, String>,
-        twins: HashSet<String>,
-    }
-    let file_subjects = nodes.iter().filter(|r| r.ty == GL_FILE).count();
-    let typed_files: HashSet<&str> = nodes
-        .iter()
-        .filter(|r| r.ty == GL_FILE)
-        .map(|r| r.id.as_str())
-        .collect();
-    let unbridged_things = aliases
-        .iter()
-        .filter(|a| !typed_files.contains(a.file.as_str()))
-        .count();
-
-    let mut by_subject: HashMap<String, Agg> = HashMap::new();
-    for r in &nodes {
-        let id = fold(&r.id);
-        let e = by_subject.entry(id.clone()).or_insert_with(|| Agg {
-            id: id.clone(),
-            types: vec![],
-            labels: HashMap::new(),
-            twins: HashSet::new(),
-        });
-        e.types.push(r.ty.clone());
-        if let Some(l) = &r.label {
-            e.labels.insert(r.ty.clone(), l.clone());
-        }
-        e.twins.insert(r.id.clone());
-    }
-
-    let docs: Vec<Placed> = by_subject
-        .into_values()
-        .filter_map(|e| {
-            // The most specific type wins: a document that is both a File and
-            // a Note is a Note. File is the transitory plane — substrate, not
-            // identity — so it is only the answer when it is the only answer.
-            let ty = e
-                .types
-                .iter()
-                .find(|t| t.as_str() != GL_FILE)
-                .cloned()
-                .or_else(|| e.types.first().cloned())?;
-            // A real title, from either plane, beats the slug that
-            // `/api/viz/nodes` hands back. Checked across every twin, because
-            // the title commonly sits on the file while the type sits on the
-            // Thing.
-            let resolved = e
-                .twins
-                .iter()
-                .filter_map(|t| best_label.get(t.as_str()).map(|(r, l)| (*r, *l)))
-                .min_by_key(|(r, _)| *r)
-                .map(|(_, l)| l.to_string());
-            let resolved_present = resolved.is_some();
-            // Fall back to the FOLDED id's last segment, not to the slug that
-            // came back on the node row.
-            //
-            // These are usually the same string, and in one case they are
-            // not: SOUL.md. Its Thing is minted from the genesis sha, so its
-            // slug is a 40-character hash — and on the single document whose
-            // job is to say WHICH SOUL THIS IS, the untitled fallback
-            // rendered as `e3d71e7f0e022e54...`. That is the hex-string
-            // symptom itself, surviving the very fix that was meant to end
-            // it, on the worst possible document. The folded id is the file,
-            // so its last segment is `SOUL.md`, which is a name a person can
-            // read.
-            let label = resolved.unwrap_or_else(|| short_name(&e.id));
-            // A document is as old as the earliest fact about EITHER of its
-            // subjects: a Thing minted later than its File is the same
-            // document arriving, not a new one.
-            let born = e.twins.iter().filter_map(|t| born_of.get(t.as_str()).copied()).min();
-            let events = e
-                .twins
-                .iter()
-                .map(|t| events_of.get(t.as_str()).copied().unwrap_or(0))
-                .sum();
-            Some(Placed {
-                id: e.id,
-                group: ty,
-                titled: resolved_present,
-                label,
-                born,
-                events,
-            })
-        })
-        .collect();
-
-    // --- classes ----------------------------------------------------------
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for d in &docs {
-        *counts.entry(d.group.as_str()).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-
-    // Colour order is meaning order, not size order. On a soul with many
-    // unclassed documents, File is also the biggest class — sorting by size
-    // hands the loudest colour to the least meaningful thing on screen. It
-    // goes last, and it goes grey.
-    let mut classes: Vec<ClassInfo> = ranked
-        .iter()
-        .filter(|(u, _)| *u != GL_FILE)
-        .enumerate()
-        .map(|(i, (uri, count))| ClassInfo {
-            uri: uri.to_string(),
-            name: short_name(uri),
-            count: *count,
-            color: color_for(i),
-        })
-        .collect();
-    for (uri, count) in ranked.iter().filter(|(u, _)| *u == GL_FILE) {
-        classes.push(ClassInfo {
-            uri: uri.to_string(),
-            // Not "File". After folding, this counts documents that are ONLY
-            // a file — the ones with no Thing speaking through them. Labelled
-            // "File" it sat on the same page as the store's raw file count
-            // under the same word, 68 against 135, with nothing saying they
-            // were answers to different questions.
-            name: "File only".to_string(),
-            count: *count,
-            color: "#b9b9bd".to_string(),
-        });
-    }
-    let file_only = classes.iter().find(|c| c.uri == GL_FILE).map_or(0, |c| c.count);
-    place_and_pack(
-        Shared { genesis_sha, head_sha, store_head, commits_behind },
-        docs,
-        classes,
-        &fold,
-        edges,
-        link_born_rows,
-        date_rows,
-        Census {
-            view: View::Typed,
-            file_subjects,
-            folded_files: file_subjects.saturating_sub(file_only),
-            unbridged_things,
-            other_files: 0,
-            machinery_files: 0,
-        },
-    )
 }
 
 pub const FILE_PREFIX: &str = "https://repolex.ai/git-lex/File/";
@@ -1048,19 +767,14 @@ pub fn build_base(
         link_born_rows,
         date_rows,
         Census {
-            view: View::Base,
-            file_subjects: 0,
-            folded_files: 0,
-            unbridged_things: 0,
             other_files,
             machinery_files,
         },
     )
 }
 
-/// One document, ready to be placed. Both views reduce to this: the typed
-/// view groups by class, the base view by folder, and nothing below that
-/// point knows which one it was given.
+/// One document, ready to be placed. Its group is a kit type or a folder,
+/// and nothing below this point knows which.
 struct Placed {
     id: String,
     label: String,
@@ -1079,19 +793,15 @@ struct Shared<'a> {
     commits_behind: Option<usize>,
 }
 
-/// View-specific counts carried through to the metadata unchanged.
+/// Counts of what was not drawn, carried through to the metadata unchanged.
 struct Census {
-    view: View,
-    file_subjects: usize,
-    folded_files: usize,
-    unbridged_things: usize,
     other_files: usize,
     machinery_files: usize,
 }
 
 /// Place documents on the spiral, resolve links, and pack the result.
 ///
-/// Everything here is the same for every view: angle is the birth commit,
+/// Everything here is the same for every document: angle is the birth commit,
 /// size is how often a document changed, colour is its legend entry.
 #[allow(clippy::too_many_arguments)]
 fn place_and_pack(
@@ -1392,7 +1102,6 @@ fn place_and_pack(
 
     Layout {
         meta: LayoutMeta {
-            view: census.view,
             genesis_sha: shared.genesis_sha.to_string(),
             head_sha: shared.head_sha.to_string(),
             store_head: shared.store_head,
@@ -1412,9 +1121,6 @@ fn place_and_pack(
             links_undated,
             first_ordinal: if dated.is_empty() { None } else { Some(min_b) },
             last_ordinal: if dated.is_empty() { None } else { Some(max_b) },
-            file_subjects: census.file_subjects,
-            folded_files: census.folded_files,
-            unbridged_things: census.unbridged_things,
             other_files: census.other_files,
             machinery_files: census.machinery_files,
             titled,
@@ -1471,94 +1177,6 @@ mod tests {
 
     use super::*;
 
-    fn rows<T: serde::de::DeserializeOwned>(dir: &str, name: &str) -> Vec<T> {
-        let text = std::fs::read_to_string(format!("{dir}/{name}")).expect("fixture");
-        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
-        serde_json::from_value(v["results"].clone()).expect("rows")
-    }
-
-    /// Build a real soul's layout from captured server responses.
-    ///
-    /// Run against the largest soul on this machine — ~12.9k node rows
-    /// folding through 6.5k aliases — because every constraint in this module
-    /// is about what happens at scale, and a 147-document soul exercises none
-    /// of them. Set `GIT_LEX_UI_FIXTURES` to a directory holding the five
-    /// captured responses; skipped when it is not set, so the suite still
-    /// runs on a machine without them.
-    #[test]
-    fn builds_a_large_soul() {
-        let Ok(dir) = std::env::var("GIT_LEX_UI_FIXTURES") else {
-            eprintln!("GIT_LEX_UI_FIXTURES not set — skipping the scale test");
-            return;
-        };
-
-        let nodes: Vec<NodeRow> = rows(&dir, "lux_nodes.json");
-        let edges: Vec<EdgeRow> = rows(&dir, "lux_edges.json");
-        let aliases: Vec<AliasRow> = rows(&dir, "lux_alias.json");
-        let born: Vec<BornRow> = rows(&dir, "lux_born.json");
-        let dates: Vec<DateRow> = rows(&dir, "lux_dates.json");
-        let labels: Vec<LabelRow> = Vec::new();
-        let node_rows = nodes.len();
-
-        let t0 = std::time::Instant::now();
-        let l = build("genesis", "head", nodes, edges, Vec::new(), aliases, born, dates, labels, None, None);
-        let elapsed = t0.elapsed();
-
-        eprintln!(
-            "{node_rows} node rows -> {} documents, {} edges, {} turns, in {elapsed:?} ({} bytes packed)",
-            l.meta.node_count, l.meta.edge_count, l.meta.turns, l.meta.offsets.total
-        );
-
-        assert!(l.meta.node_count > 5000, "folding lost documents");
-        assert_eq!(l.meta.docs.len(), l.meta.node_count);
-        assert_eq!(l.meta.offsets.positions_bytes, l.meta.node_count * 8);
-        assert_eq!(l.meta.offsets.colors_bytes, l.meta.node_count * 3);
-        assert_eq!(l.meta.offsets.edges_bytes, l.meta.edge_count * 8);
-        assert_eq!(l.meta.offsets.edge_predicates_bytes, l.meta.edge_count * 2);
-        // Every drawn edge must name a predicate that exists in the table,
-        // or the legend and the picture are describing different graphs.
-        let at = l.meta.offsets.edge_predicates;
-        for i in 0..l.meta.edge_count {
-            let v = u16::from_le_bytes(l.data[at + i * 2..at + i * 2 + 2].try_into().unwrap());
-            assert!(
-                (v as usize) < l.meta.predicates.len(),
-                "edge predicate index {v} is not in the predicate table"
-            );
-        }
-        assert_eq!(
-            l.meta.predicates.iter().map(|p| p.count).sum::<usize>(),
-            l.meta.edge_count,
-            "predicate counts must account for every drawn edge"
-        );
-        assert_eq!(l.data.len(), l.meta.offsets.total);
-
-        // Every edge index must address a real node. An out-of-range index is
-        // not a wrong picture, it is a GPU read past the end of a buffer.
-        let idx = l.meta.offsets.edges;
-        for i in 0..l.meta.edge_count * 2 {
-            let at = idx + i * 4;
-            let v = u32::from_le_bytes(l.data[at..at + 4].try_into().unwrap());
-            assert!((v as usize) < l.meta.node_count, "edge index {v} out of range");
-        }
-
-        // The layout must be a pure function of its input: same soul in, same
-        // picture out, or it is not something two people can talk about.
-        let l2 = build(
-            "genesis",
-            "head",
-            rows(&dir, "lux_nodes.json"),
-            rows(&dir, "lux_edges.json"),
-            Vec::new(),
-            rows(&dir, "lux_alias.json"),
-            rows(&dir, "lux_born.json"),
-            rows(&dir, "lux_dates.json"),
-            Vec::new(),
-            None,
-            None,
-        );
-        assert_eq!(l.data, l2.data, "layout is not deterministic");
-    }
-
     /// Every document must land within the spiral's own track, offset only
     /// along the normal. Spreading a same-commit cohort along the ANGLE would
     /// make an afternoon's import read as weeks of work, and the failure is
@@ -1567,28 +1185,26 @@ mod tests {
     fn same_commit_documents_spread_across_the_track_not_along_it() {
         // 40 documents, all born in one commit, plus one earlier and one later
         // so the spiral has a span to place them on.
-        let mut nodes = vec![];
-        let mut born = vec![];
-        for i in 0..40 {
-            let id = format!("https://example/File/doc{i}.md");
-            nodes.push(NodeRow {
-                id: id.clone(),
-                label: Some(format!("doc{i}")),
-                ty: "https://repolex.ai/ontology/soul/Note".to_string(),
-            });
-            born.push(BornRow { s: id, born: "50".into(), events: "1".into() });
+        let mut paths: Vec<String> = (0..40).map(|i| format!("doc{i}.md")).collect();
+        paths.extend(["first.md".to_string(), "last.md".to_string()]);
+        let mut history = HashMap::new();
+        for p in &paths {
+            let sha = match p.as_str() {
+                "first.md" => "c1",
+                "last.md" => "c100",
+                _ => "c50",
+            };
+            history.insert(p.clone(), PathHistory { first_sha: sha.into(), commits: 1 });
         }
-        for (i, o) in [("first", "1"), ("last", "100")] {
-            let id = format!("https://example/File/{i}.md");
-            nodes.push(NodeRow {
-                id: id.clone(),
-                label: Some(i.to_string()),
-                ty: "https://repolex.ai/ontology/soul/Note".to_string(),
-            });
-            born.push(BornRow { s: id, born: o.into(), events: "1".into() });
-        }
-
-        let l = build("g", "h", nodes, vec![], vec![], vec![], born, vec![], vec![], None, None);
+        let ords = [1, 50, 100]
+            .iter()
+            .map(|o| OrdinalRow { id: format!("c{o}"), ord: o.to_string() })
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let l = build_base(
+            "g", "h", tree(&refs), &history, ords,
+            vec![], vec![], vec![], vec![], vec![], vec![], None, None,
+        );
         let turns = l.meta.turns as f32;
 
         // Recover each cohort member's angle and radius.
@@ -1658,7 +1274,6 @@ mod tests {
             "README.md", "docs/one.md", "docs/two.MD", "notes/x.markdown",
             "src/main.rs", "Cargo.toml", ".lex/COMPACT-ONTOLOGY.md",
         ]);
-        assert_eq!(l.meta.view, View::Base);
         assert_eq!(l.meta.node_count, 4);
         assert_eq!(l.meta.other_files, 2);
         assert_eq!(l.meta.machinery_files, 1);

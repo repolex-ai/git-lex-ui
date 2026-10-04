@@ -16,7 +16,7 @@
 //! is where a repo is sitting today; the genesis sha is which repo it is. Key
 //! on the path and every `mv` silently orphans the cache.
 
-use crate::layout::{self, Layout, View};
+use crate::layout::{self, Layout};
 use crate::sparql::SparqlClient;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// tell. Halving the node sizes was exactly that: a change no key could see.
 /// A cache that cannot notice its own producer changed is the same defect as
 /// a figure that was correct when computed and wrong when read.
-const LAYOUT_VERSION: u32 = 6;
+const LAYOUT_VERSION: u32 = 7;
 
 pub struct Cached {
     pub meta_json: String,
@@ -41,28 +41,26 @@ fn dir_for(cache_root: &Path, genesis: &str) -> PathBuf {
     cache_root.join(genesis)
 }
 
-fn paths(cache_root: &Path, genesis: &str, head: &str, view: View) -> (PathBuf, PathBuf) {
+fn paths(cache_root: &Path, genesis: &str, head: &str) -> (PathBuf, PathBuf) {
     let d = dir_for(cache_root, genesis);
-    let v = view.as_str();
     (
-        d.join(format!("layout-v{LAYOUT_VERSION}-{v}-{head}.json")),
-        d.join(format!("layout-v{LAYOUT_VERSION}-{v}-{head}.bin")),
+        d.join(format!("layout-v{LAYOUT_VERSION}-{head}.json")),
+        d.join(format!("layout-v{LAYOUT_VERSION}-{head}.bin")),
     )
 }
 
-pub fn load(cache_root: &Path, genesis: &str, head: &str, view: View) -> Option<Cached> {
-    let (m, b) = paths(cache_root, genesis, head, view);
+pub fn load(cache_root: &Path, genesis: &str, head: &str) -> Option<Cached> {
+    let (m, b) = paths(cache_root, genesis, head);
     let meta_json = std::fs::read_to_string(&m).ok()?;
     let data = std::fs::read(&b).ok()?;
     Some(Cached { meta_json, data, from_cache: true })
 }
 
 pub fn store(cache_root: &Path, genesis: &str, head: &str, l: &Layout) -> Result<String, String> {
-    let view = l.meta.view;
     let d = dir_for(cache_root, genesis);
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     let meta_json = serde_json::to_string(&l.meta).map_err(|e| e.to_string())?;
-    let (m, b) = paths(cache_root, genesis, head, view);
+    let (m, b) = paths(cache_root, genesis, head);
     std::fs::write(&m, &meta_json).map_err(|e| e.to_string())?;
     std::fs::write(&b, &l.data).map_err(|e| e.to_string())?;
 
@@ -71,11 +69,8 @@ pub fn store(cache_root: &Path, genesis: &str, head: &str, l: &Layout) -> Result
     if let Ok(rd) = std::fs::read_dir(&d) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            // Only this view's siblings: the other view built from the same
-            // HEAD is still good.
-            let this_view = format!("-{}-", view.as_str());
-            if name.starts_with("layout-") && !name.contains(head) && name.contains(&this_view)
-                || name.starts_with("layout-") && !name.starts_with(&format!("layout-v{LAYOUT_VERSION}-"))
+            if name.starts_with("layout-")
+                && (!name.contains(head) || !name.starts_with(&format!("layout-v{LAYOUT_VERSION}-")))
             {
                 let _ = std::fs::remove_file(e.path());
             }
@@ -92,11 +87,10 @@ pub async fn build_from_server(
     genesis: &str,
     head: &str,
     repo_path: &std::path::Path,
-    view: View,
 ) -> Result<Layout, String> {
     let c = SparqlClient::for_soul(http.clone(), daemon_port, genesis);
 
-    // Six reads, all through the one SPARQL endpoint. The old viewer's
+    // Every read goes through the one SPARQL endpoint. The old viewer's
     // `/api/viz/nodes` and `/api/viz/edges` were only ever SPARQL wearing a
     // REST hat; asking directly removes the dependency on that server and
     // lets the edge query be the one this view actually needs.
@@ -127,70 +121,10 @@ pub async fn build_from_server(
         None => None,
     };
 
-    if view == View::Base {
-        return build_base(&c, genesis, head, repo_path, store_head, commits_behind).await;
-    }
-
-    // Ask for documents FIRST, alone, and stop if there are none.
-    //
-    // These seven queries used to fan out together and the empty-store check
-    // ran after all of them had returned. On lUX — 1.5 million facts, and a
-    // store whose `now` view an interrupted sync had never created — that
-    // meant 26 seconds of work before reporting a problem the first query
-    // already knew about, on every single load, with nothing cacheable at the
-    // end of it. The cost of asking first is one extra round trip on the
-    // healthy path; the saving is everything on the broken one.
-    let nodes = c.query::<layout::NodeRow>(&layout::q_nodes()).await?;
-    if nodes.is_empty() {
-        // Two different situations, and only one of them is fixed by a sync.
-        // A store that is current and still has no typed documents is a repo
-        // nothing has typed — the base view is the answer there, not a sync.
-        return Err(if store_head.as_deref() == Some(head) {
-            "this store has no typed documents — nothing in this repo has been given a type"
-                .to_string()
-        } else {
-            "this store has no documents in its `now` view — run `git lex sync` in the repo"
-                .to_string()
-        });
-    }
-
-    let (qe, qa, qb, qd, ql, qlb) = (
-        layout::q_edges(),
-        layout::q_alias(),
-        layout::q_born(),
-        layout::q_dates(),
-        layout::q_labels(),
-        layout::q_link_born(),
-    );
-    let (edges, aliases, born, dates, labels, link_born) = tokio::join!(
-        c.query::<layout::EdgeRow>(&qe),
-        c.query::<layout::AliasRow>(&qa),
-        c.query::<layout::BornRow>(&qb),
-        c.query::<layout::DateRow>(&qd),
-        c.query::<layout::LabelRow>(&ql),
-        c.query::<layout::LinkBornRow>(&qlb),
-    );
-
-    // The remaining reads may legitimately come back empty: a soul with no
-    // links, or one whose history graph has not been built, still has a
-    // legible spiral. What it must not do is pretend — `undated` and
-    // `dropped` in the metadata carry the shortfall.
-    Ok(layout::build(
-        genesis,
-        head,
-        nodes,
-        edges.unwrap_or_default(),
-        link_born.unwrap_or_default(),
-        aliases.unwrap_or_default(),
-        born.unwrap_or_default(),
-        dates.unwrap_or_default(),
-        labels.unwrap_or_default(),
-        store_head,
-        commits_behind,
-    ))
+    build_base(&c, genesis, head, repo_path, store_head, commits_behind).await
 }
 
-/// The base view: the store's file tree, dated by git.
+/// The store's file tree, dated by git, coloured by kit type or folder.
 async fn build_base(
     c: &SparqlClient,
     genesis: &str,

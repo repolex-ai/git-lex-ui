@@ -30,7 +30,7 @@ use axum::{
 };
 use clap::Parser;
 use daemon::Daemon;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -647,51 +647,20 @@ async fn explain_failure(s: &Arc<AppState>, genesis: &str, err: String) -> Strin
     err
 }
 
-#[derive(Deserialize)]
-struct ViewQuery {
-    #[serde(default)]
-    view: Option<String>,
-}
-
-/// `?view=base` or `?view=typed`; base when absent. Base is the page's one
-/// view since 2026-09-24 — every markdown file, coloured by kit type where it
-/// has one and by folder where it does not. Typed stays servable so the two
-/// can still be compared. An unknown value is an
-/// error rather than a quiet default — a misspelt view drawing the other one
-/// would look like a correct answer.
-fn view_of(q: &ViewQuery) -> Result<layout::View, Response> {
-    match q.view.as_deref() {
-        None => Ok(layout::View::Base),
-        Some(v) => layout::View::parse(v).ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, format!("unknown view `{v}` — use base or typed")).into_response()
-        }),
-    }
-}
-
-/// In-memory payloads are held per repo AND per view.
-fn layout_key(genesis: &str, view: layout::View) -> String {
-    format!("{genesis}:{}", view.as_str())
-}
-
 /// Build (or reuse) the layout and return its metadata. The binary payload
 /// comes from the companion `/data` route.
 async fn api_layout_meta(
     State(s): State<Arc<AppState>>,
     AxPath(genesis): AxPath<String>,
-    axum::extract::Query(q): axum::extract::Query<ViewQuery>,
 ) -> Response {
-    let view = match view_of(&q) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
     let probe = match layout_target(&s, &genesis).await {
         Ok(v) => v,
         Err((c, m)) => return (c, m).into_response(),
     };
     let head = probe.head_sha.clone().unwrap_or_default();
-    let key = layout_key(&genesis, view);
+    let key = genesis.clone();
 
-    if let Some(c) = layout_api::load(&s.cache_dir, &genesis, &head, view) {
+    if let Some(c) = layout_api::load(&s.cache_dir, &genesis, &head) {
         s.layouts.write().await.insert(key, Arc::new(c.data));
         return (
             [
@@ -712,7 +681,6 @@ async fn api_layout_meta(
         &genesis,
         &head,
         std::path::Path::new(&probe.path),
-        view,
     )
     .await
     {
@@ -743,13 +711,8 @@ async fn api_layout_meta(
 async fn api_layout_data(
     State(s): State<Arc<AppState>>,
     AxPath(genesis): AxPath<String>,
-    axum::extract::Query(q): axum::extract::Query<ViewQuery>,
 ) -> Response {
-    let view = match view_of(&q) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    if let Some(d) = s.layouts.read().await.get(&layout_key(&genesis, view)).cloned() {
+    if let Some(d) = s.layouts.read().await.get(&genesis).cloned() {
         return (
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
             (*d).clone(),
@@ -1067,8 +1030,7 @@ async fn api_sync_start(
             }
         }
         let mut held = st.layouts.write().await;
-        held.remove(&layout_key(&genesis, layout::View::Base));
-        held.remove(&layout_key(&genesis, layout::View::Typed));
+        held.remove(&genesis);
     });
 
     (StatusCode::ACCEPTED, axum::Json(SyncState::Running { started_ms: started })).into_response()

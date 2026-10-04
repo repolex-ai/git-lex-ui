@@ -332,13 +332,11 @@
     {/if}
   </div>
 
-  {#if meta && (meta.dropped.length || meta.undated || meta.view === 'base')}
+  {#if meta}
     <div class="disclose">
-      {#if meta.view === 'base'}
-        <span title="The base view draws markdown only. Files under .lex/ are git-lex's own machinery (kit copies, the compact ontology), not anybody's writing.">
-          not drawn: <b>{meta.other_files}</b> other files{#if meta.machinery_files}, <b>{meta.machinery_files}</b> under .lex/{/if}
-        </span>
-      {/if}
+      <span title="The view draws markdown only. Files under .lex/ are git-lex's own machinery (kit copies, the compact ontology), not anybody's writing.">
+        not drawn: <b>{meta.other_files}</b> other files{#if meta.machinery_files}, <b>{meta.machinery_files}</b> under .lex/{/if}
+      </span>
       {#if meta.undated}<span><b>{meta.undated}</b> undated, drawn on the rim</span>{/if}
       {#if meta.links_undated}
         <span title="The store records no commit for these links, so they cannot be placed on the replay timeline. They appear when the replay finishes.">
