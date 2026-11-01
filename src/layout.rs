@@ -212,11 +212,18 @@ pub fn q_labels() -> String {
 /// view is built from frontmatter and links, so a repo whose markdown carries
 /// neither can have no `now` view at all — git-lex itself is one — while its
 /// file tree is complete.
+///
+/// git-lex keeps it in one `filetree` graph, addressed by path (git-lex
+/// 183c0ce, 2026-10-04). A store not synced since then still has the older
+/// per-commit `filetree/<sha>` graph, so both are read; a store only ever
+/// holds one of them.
 pub fn q_filetree(store_head: &str) -> String {
     format!(
         "PREFIX g2: <https://repolex.ai/ontology/git-lex/git2/>
-         SELECT ?path WHERE {{
-             GRAPH <https://repolex.ai/git-lex/NamedGraph/filetree/{store_head}> {{ ?e g2:path ?path }}
+         SELECT DISTINCT ?path WHERE {{
+             {{ GRAPH <https://repolex.ai/git-lex/NamedGraph/filetree> {{ ?e g2:path ?path }} }}
+             UNION
+             {{ GRAPH <https://repolex.ai/git-lex/NamedGraph/filetree/{store_head}> {{ ?e g2:path ?path }} }}
          }}"
     )
 }
